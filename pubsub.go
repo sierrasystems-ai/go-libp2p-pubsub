@@ -183,6 +183,18 @@ type PubSub struct {
 	inboundControlMx sync.Mutex
 	inboundControl   map[peer.ID]*inboundControlState
 
+	// inboundTopicStreams counts concurrent inbound topic streams per
+	// (peer, topic) to enforce the per-topic limit. Non-nil only when the Topic
+	// Streams extension is enabled. Guarded by topicStreamCountMx as it is
+	// accessed from inbound stream-handler goroutines.
+	topicStreamCountMx  sync.Mutex
+	inboundTopicStreams map[peer.ID]map[string]int
+
+	// recentlyUnsubscribed tracks topics we recently unsubscribed from, so we do
+	// not penalize peers that send us a publish before learning of the
+	// unsubscribe. Only accessed from the processLoop goroutine.
+	recentlyUnsubscribed map[string]time.Time
+
 	seenMessages    timecache.TimeCache
 	seenMsgTTL      time.Duration
 	seenMsgStrategy timecache.Strategy
@@ -595,6 +607,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		peers:                 make(map[peer.ID]*rpcQueue),
 		peerTransports:        make(map[peer.ID]*peerTransport),
 		inboundStreams:        make(map[peer.ID]inboundHandler),
+		recentlyUnsubscribed:  make(map[string]time.Time),
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
 		seenMsgTTL:            TimeCacheDuration,
@@ -644,6 +657,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 	// enabled, so peers that haven't opted in behave exactly as before.
 	if gs, ok := rt.(*GossipSubRouter); ok && gs.extensions.myExtensions.TopicStreams {
 		ps.inboundControl = make(map[peer.ID]*inboundControlState)
+		ps.inboundTopicStreams = make(map[peer.ID]map[string]int)
 		h.SetStreamHandler(TopicStreamsProtocolID, ps.handleNewTopicStream)
 	}
 
@@ -1186,6 +1200,11 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 				p.announce(sub.topic, false)
 				p.rt.Leave(sub.topic)
 			}
+			// Remember that we just unsubscribed so we don't penalize peers
+			// that send us a message before learning of the unsubscribe.
+			if p.recentlyUnsubscribed != nil {
+				p.recentlyUnsubscribed[sub.topic] = time.Now()
+			}
 		}
 	}
 }
@@ -1501,6 +1520,12 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		for _, pmsg := range rpc.GetPublish() {
 			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
 				p.logger.Debug("received message in topic we didn't subscribe to; ignoring message")
+				// Penalize peers that send us messages for topics we are not
+				// subscribed to, unless we recently unsubscribed (the peer may
+				// not have learned of the unsubscribe yet).
+				if !p.recentlyUnsubscribedFrom(pmsg.GetTopic()) {
+					p.penalizePeer(rpc.from, unsubscribedTopicPenalty)
+				}
 				continue
 			}
 

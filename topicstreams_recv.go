@@ -131,6 +131,14 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 	}
 	topic := hdr.GetTopic()
 
+	// Enforce the per-(peer, topic) concurrency limit.
+	if !p.acquireInboundTopicStream(pid, topic) {
+		p.logger.Debug("too many concurrent topic streams for topic; resetting", "peer", pid, "topic", topic)
+		p.penalizePeer(pid, tooManyTopicStreamsPenalty)
+		return
+	}
+	defer p.releaseInboundTopicStream(pid, topic)
+
 	ctrl := p.inboundControlStateFor(pid)
 	helloSeen := false
 
