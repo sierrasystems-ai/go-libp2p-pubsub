@@ -237,7 +237,6 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 }
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC, transport *peerTransport) {
-	_ = transport // used in the Topic Streams outbound path (see sendOutgoingRPC)
 	writeRpc := func(rpc *RPC) error {
 		size := uint64(proto.Size(&rpc.RPC))
 
@@ -280,11 +279,27 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 	}
 
 	defer s.Close()
+
+	// Topic Streams: when negotiated with this peer, topic-scoped messages
+	// (publish + partial) are sent on dedicated per-topic streams instead of
+	// the control stream. The router is unaware of this; it keeps producing
+	// ordinary RPCs and this writer splits them at send time.
+	topicStreams := newTopicStreamSet(p, ctx, s.Conn().RemotePeer())
+	defer topicStreams.close()
+
 	for ctx.Err() == nil {
 		rpc, err := outgoing.Pop(ctx)
 		if err != nil {
 			p.logger.Debug("error popping message from the queue to send to peer", "peer", s.Conn().RemotePeer(), "err", err)
 			return
+		}
+
+		if transport != nil && transport.topicStreamsEnabled.Load() {
+			p.sendRPCOverTopicStreams(rpc, topicStreams)
+			rpc = topicStreamControlRemainder(rpc)
+			if rpc == nil {
+				continue
+			}
 		}
 
 		err = writeRpc(rpc)
