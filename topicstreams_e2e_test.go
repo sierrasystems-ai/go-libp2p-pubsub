@@ -3,9 +3,15 @@ package pubsub
 import (
 	"bytes"
 	"context"
+	"log/slog"
+	"os"
+	"slices"
 	"testing"
 	"time"
 
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"github.com/libp2p/go-libp2p-pubsub/partialmessages"
+	"github.com/libp2p/go-libp2p-pubsub/partialmessages/bitmap"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
@@ -188,6 +194,112 @@ func TestTopicStreamsBackwardCompat(t *testing.T) {
 		// No topic streams should be opened since negotiation did not succeed.
 		if hasStreamProto(hosts[0], hosts[1].ID(), TopicStreamsProtocolID) {
 			t.Fatal("did not expect any /gsts/v0beta stream without mutual negotiation")
+		}
+	})
+}
+
+// TestPartialMessagesOverTopicStreams verifies that when both the Partial
+// Messages and Topic Streams extensions are negotiated, partial messages are
+// exchanged over topic streams and still reconstruct fully.
+func TestPartialMessagesOverTopicStreams(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		topic := "test-topic"
+		const hostCount = 2
+		hosts := getDefaultHosts(t, hostCount)
+		psubs := make([]*PubSub, 0, len(hosts))
+
+		gossipsubCtx, closeGossipsub := context.WithCancel(context.Background())
+		go func() {
+			<-gossipsubCtx.Done()
+			for _, h := range hosts {
+				h.Close()
+			}
+		}()
+
+		partialExt := make([]*partialmessages.PartialMessagesExtension[peerState], hostCount)
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+		partialMessageStore := make([]map[string]*minimalTestPartialMessage, hostCount)
+		for i := range hostCount {
+			partialMessageStore[i] = make(map[string]*minimalTestPartialMessage)
+		}
+
+		for i := range partialExt {
+			partialExt[i] = &partialmessages.PartialMessagesExtension[peerState]{
+				Logger: logger.With("id", i),
+				OnEmitGossip: func(topic string, groupID []byte, gossipPeers []peer.ID, peerStates map[peer.ID]peerState) {
+					pm := partialMessageStore[i][topic+string(groupID)]
+					if pm == nil {
+						return
+					}
+					partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
+				},
+				OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
+					peerState := peerStates[from]
+					groupID := rpc.GroupID
+					pm, ok := partialMessageStore[i][topic+string(groupID)]
+					if !ok {
+						pm = &minimalTestPartialMessage{Group: groupID}
+						partialMessageStore[i][topic+string(groupID)] = pm
+					}
+					if rpc.PartsMetadata != nil {
+						peerState.recvd = bitmap.Merge(peerState.recvd, rpc.PartsMetadata)
+					}
+					prevMeta := slices.Clone(pm.PartsMetadata())
+					shouldRepublish := pm.onIncomingRPC(from, rpc)
+					if !bytes.Equal(prevMeta, pm.PartsMetadata()) {
+						peerState.sent = bitmap.Merge(peerState.sent, pm.PartsMetadata())
+					}
+					peerStates[from] = peerState
+					if shouldRepublish {
+						go PublishPartial(psubs[i], topic, pm.GroupID(), pm.publishActions)
+					}
+					return nil
+				},
+			}
+		}
+
+		for i, h := range hosts {
+			psub := getGossipsub(gossipsubCtx, h,
+				WithPartialMessagesExtension(partialExt[i]),
+				WithTopicStreams(),
+			)
+			tp, err := psub.Join(topic, RequestPartialMessages())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tp.Subscribe(); err != nil {
+				t.Fatal(err)
+			}
+			psubs = append(psubs, psub)
+		}
+
+		connect(t, hosts[0], hosts[1])
+		time.Sleep(2 * time.Second)
+
+		group := []byte("test-group")
+		msg1 := &minimalTestPartialMessage{
+			Group: group,
+			Parts: [2][]byte{[]byte("Hello"), []byte("World")},
+		}
+		partialMessageStore[0][topic+string(group)] = msg1
+		if err := PublishPartial(psubs[0], topic, msg1.GroupID(), msg1.publishActions); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(2 * time.Second)
+		closeGossipsub()
+		time.Sleep(time.Second)
+
+		for i, msgStore := range partialMessageStore {
+			if len(msgStore) == 0 {
+				t.Errorf("Host %d is missing the partial message", i)
+			}
+			for _, pm := range msgStore {
+				if !pm.complete() {
+					t.Errorf("host %d: expected complete message, but %v is incomplete", i, pm)
+				}
+			}
 		}
 	})
 }
