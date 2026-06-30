@@ -2,7 +2,9 @@ package pubsub
 
 import (
 	"bytes"
+	"context"
 	"testing"
+	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
@@ -48,6 +50,102 @@ func TestTopicScopedRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got.Key, orig.Key) {
 		t.Fatalf("key mismatch")
+	}
+}
+
+func TestTopicStreamControlRemainder(t *testing.T) {
+	// Publish-only: nothing belongs on the control stream.
+	pubOnly := &RPC{RPC: pb.RPC{Publish: []*pb.Message{{Topic: proto.String("t")}}}}
+	if rem := topicStreamControlRemainder(pubOnly); rem != nil {
+		t.Fatal("publish-only RPC should have no control-stream remainder")
+	}
+
+	// Publish + control: the control parts stay, the publish does not.
+	withCtrl := &RPC{RPC: pb.RPC{
+		Publish: []*pb.Message{{Topic: proto.String("t")}},
+		Control: &pb.ControlMessage{},
+	}}
+	rem := topicStreamControlRemainder(withCtrl)
+	if rem == nil || rem.Control == nil {
+		t.Fatal("expected control to remain on the control stream")
+	}
+	if len(rem.Publish) != 0 {
+		t.Fatal("publish must not be on the control stream")
+	}
+}
+
+func TestAcquireInboundTopicStreamLimit(t *testing.T) {
+	p := &PubSub{inboundTopicStreams: make(map[peer.ID]map[string]int)}
+	pid := peer.ID("peer")
+	topic := "t"
+
+	for i := 0; i < maxConcurrentInboundTopicStreamsPerTopic; i++ {
+		if !p.acquireInboundTopicStream(pid, topic) {
+			t.Fatalf("acquire %d should succeed", i)
+		}
+	}
+	if p.acquireInboundTopicStream(pid, topic) {
+		t.Fatal("acquiring beyond the limit should fail")
+	}
+	// A different topic is independent.
+	if !p.acquireInboundTopicStream(pid, "other") {
+		t.Fatal("different topic should be allowed")
+	}
+	// Releasing frees a slot.
+	p.releaseInboundTopicStream(pid, topic)
+	if !p.acquireInboundTopicStream(pid, topic) {
+		t.Fatal("acquire after release should succeed")
+	}
+}
+
+func TestInboundControlGatingDropAfterClose(t *testing.T) {
+	p := &PubSub{inboundControl: make(map[peer.ID]*inboundControlState)}
+	pid := peer.ID("peer")
+
+	st := p.inboundControlStateFor(pid)
+	p.controlStreamClosed(pid)
+
+	dropped, ok := st.waitForHello(context.Background())
+	if !ok {
+		t.Fatal("waitForHello should not have been cancelled")
+	}
+	if !dropped {
+		t.Fatal("expected drop after the control stream closed")
+	}
+}
+
+func TestInboundControlGatingHelloFirst(t *testing.T) {
+	p := &PubSub{inboundControl: make(map[peer.ID]*inboundControlState)}
+	pid := peer.ID("peer")
+
+	st := p.inboundControlStateFor(pid)
+
+	type result struct {
+		dropped bool
+		ok      bool
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		dropped, ok := st.waitForHello(context.Background())
+		resCh <- result{dropped, ok}
+	}()
+
+	// The waiter must still be blocked before the hello is enqueued.
+	select {
+	case <-resCh:
+		t.Fatal("waitForHello returned before the control hello was enqueued")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	p.controlHelloEnqueued(pid)
+
+	select {
+	case r := <-resCh:
+		if !r.ok || r.dropped {
+			t.Fatalf("expected proceed after hello, got dropped=%t ok=%t", r.dropped, r.ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForHello did not return after the hello was enqueued")
 	}
 }
 
