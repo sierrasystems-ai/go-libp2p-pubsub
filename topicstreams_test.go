@@ -51,6 +51,26 @@ func TestTopicScopedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTopicStreamsExtensionPlumbing(t *testing.T) {
+	pe := PeerExtensions{TopicStreams: true}
+	rpc := pe.ExtendRPC(&RPC{})
+	if rpc.Control == nil || rpc.Control.Extensions == nil || !rpc.Control.Extensions.GetTopicStreams() {
+		t.Fatal("ExtendRPC did not advertise topicStreams")
+	}
+
+	got := peerExtensionsFromRPC(rpc)
+	if !got.TopicStreams {
+		t.Fatal("peerExtensionsFromRPC did not read topicStreams")
+	}
+
+	// A peer that does not advertise topicStreams must read as disabled.
+	empty := PeerExtensions{}
+	none := peerExtensionsFromRPC(empty.ExtendRPC(&RPC{}))
+	if none.TopicStreams {
+		t.Fatal("expected topicStreams to be false when not advertised")
+	}
+}
+
 // TestTopicScopedSignatureParity ensures a signed Message still verifies after
 // being converted to a TopicScopedMessage (topic stripped) and reconstructed
 // with the topic from the header. This is the crux of the wire design.

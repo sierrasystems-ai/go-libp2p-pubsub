@@ -13,6 +13,7 @@ import (
 type PeerExtensions struct {
 	TestExtension   bool
 	PartialMessages bool
+	TopicStreams    bool
 }
 
 type TestExtensionConfig struct {
@@ -44,6 +45,7 @@ func peerExtensionsFromRPC(rpc *RPC) PeerExtensions {
 	if hasPeerExtensions(rpc) {
 		out.TestExtension = rpc.Control.Extensions.GetTestExtension()
 		out.PartialMessages = rpc.Control.Extensions.GetPartialMessages()
+		out.TopicStreams = rpc.Control.Extensions.GetTopicStreams()
 	}
 	return out
 }
@@ -66,6 +68,15 @@ func (pe *PeerExtensions) ExtendRPC(rpc *RPC) *RPC {
 			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
 		}
 		rpc.Control.Extensions.PartialMessages = &pe.PartialMessages
+	}
+	if pe.TopicStreams {
+		if rpc.Control == nil {
+			rpc.Control = &pubsub_pb.ControlMessage{}
+		}
+		if rpc.Control.Extensions == nil {
+			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
+		}
+		rpc.Control.Extensions.TopicStreams = &pe.TopicStreams
 	}
 	return rpc
 }
@@ -91,6 +102,11 @@ type extensionsState struct {
 	testExtension     *testExtension
 
 	partialMessagesExtension partialMessageInterface
+
+	// onTopicStreamsEnabled / onTopicStreamsDisabled are invoked once the Topic
+	// Streams extension is mutually negotiated (or torn down) with a peer.
+	onTopicStreamsEnabled  func(peer.ID)
+	onTopicStreamsDisabled func(peer.ID)
 }
 
 func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool)) *extensionsState {
@@ -168,12 +184,18 @@ func (es *extensionsState) extensionsOnNewOutboundStream(id peer.ID) {
 	if es.myExtensions.TestExtension && es.peerExtensions[id].TestExtension {
 		es.testExtension.OnNewOutboundStream(id)
 	}
+	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsEnabled != nil {
+		es.onTopicStreamsEnabled(id)
+	}
 }
 
 // extensionsOnClosedOutboundStream is always called after extensionsOnNewOutboundStream.
 func (es *extensionsState) extensionsOnClosedOutboundStream(id peer.ID) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {
 		es.partialMessagesExtension.OnClosedOutboundStream(id)
+	}
+	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsDisabled != nil {
+		es.onTopicStreamsDisabled(id)
 	}
 }
 
@@ -195,6 +217,22 @@ func (es *extensionsState) extensionsHandleRPC(rpc *RPC) error {
 func (es *extensionsState) Heartbeat() {
 	if es.myExtensions.PartialMessages {
 		es.partialMessagesExtension.Heartbeat()
+	}
+}
+
+// WithTopicStreams enables the Topic Streams extension (see topic-streams.md).
+// When negotiated with a peer (both sides advertise support), topic-scoped
+// application messages are sent on dedicated per-topic streams
+// (TopicStreamsProtocolID) instead of the shared control stream. Requires the
+// gossipsub router on a protocol that supports extensions (v1.3).
+func WithTopicStreams() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return errors.New("pubsub router is not gossipsub")
+		}
+		gs.extensions.myExtensions.TopicStreams = true
+		return nil
 	}
 }
 

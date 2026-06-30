@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"sync/atomic"
 	"time"
 
 	pool "github.com/libp2p/go-buffer-pool"
@@ -16,6 +17,34 @@ import (
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 )
+
+// peerTransport is per-peer transport-layer state shared between the
+// processLoop/eval goroutine (which negotiates extensions) and the peer's
+// outbound writer goroutine. It is the bridge that lets the writer decide
+// whether to route topic-scoped messages onto per-topic streams.
+type peerTransport struct {
+	// topicStreamsEnabled is set once (by the eval goroutine) when the Topic
+	// Streams extension is mutually negotiated with the peer, and read by the
+	// writer goroutine. Access is via atomics so the writer never touches
+	// router/extension state directly.
+	topicStreamsEnabled atomic.Bool
+}
+
+// enableTopicStreams is called on the processLoop/eval goroutine once the Topic
+// Streams extension is negotiated with pid.
+func (p *PubSub) enableTopicStreams(pid peer.ID) {
+	if pt, ok := p.peerTransports[pid]; ok {
+		pt.topicStreamsEnabled.Store(true)
+	}
+}
+
+// disableTopicStreams is called on the processLoop/eval goroutine when the
+// negotiated outbound stream to pid is torn down.
+func (p *PubSub) disableTopicStreams(pid peer.ID) {
+	if pt, ok := p.peerTransports[pid]; ok {
+		pt.topicStreamsEnabled.Store(false)
+	}
+}
 
 // get the initial RPC containing all of our subscriptions to send to new peers
 func (p *PubSub) getHelloPacket() *RPC {
@@ -162,7 +191,7 @@ func (p *PubSub) notifyPeerDead(pid peer.ID) {
 	}
 }
 
-func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing *rpcQueue) {
+func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing *rpcQueue, transport *peerTransport) {
 	s, err := p.host.NewStream(ctx, pid, p.rt.Protocols()...)
 	if err != nil {
 		p.logger.Debug("error opening new stream to peer", "err", err, "peer", pid)
@@ -177,7 +206,7 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing *rpcQu
 
 	firstMessage := make(chan *RPC, 1)
 	sCtx, cancel := context.WithCancel(ctx)
-	go p.handleSendingMessages(sCtx, s, outgoing, firstMessage)
+	go p.handleSendingMessages(sCtx, s, outgoing, firstMessage, transport)
 	go p.handlePeerDead(s)
 	select {
 	case p.newPeerStream <- peerOutgoingStream{Stream: s, FirstMessage: firstMessage, Cancel: cancel}:
@@ -186,10 +215,10 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing *rpcQu
 	}
 }
 
-func (p *PubSub) handleNewPeerWithBackoff(ctx context.Context, pid peer.ID, backoff time.Duration, outgoing *rpcQueue) {
+func (p *PubSub) handleNewPeerWithBackoff(ctx context.Context, pid peer.ID, backoff time.Duration, outgoing *rpcQueue, transport *peerTransport) {
 	select {
 	case <-time.After(backoff):
-		p.handleNewPeer(ctx, pid, outgoing)
+		p.handleNewPeer(ctx, pid, outgoing, transport)
 	case <-ctx.Done():
 		return
 	}
@@ -207,7 +236,8 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 	p.notifyPeerDead(pid)
 }
 
-func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC) {
+func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC, transport *peerTransport) {
+	_ = transport // used in the Topic Streams outbound path (see sendOutgoingRPC)
 	writeRpc := func(rpc *RPC) error {
 		size := uint64(proto.Size(&rpc.RPC))
 

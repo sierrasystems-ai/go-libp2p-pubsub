@@ -321,6 +321,8 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 			rt.score.AddPenalty(p, 10)
 		}
 	}, rt.sendRPC)
+	rt.extensions.onTopicStreamsEnabled = func(p peer.ID) { rt.p.enableTopicStreams(p) }
+	rt.extensions.onTopicStreamsDisabled = func(p peer.ID) { rt.p.disableTopicStreams(p) }
 
 	return rt
 }

@@ -168,6 +168,11 @@ type PubSub struct {
 
 	peers map[peer.ID]*rpcQueue
 
+	// peerTransports holds per-peer transport-layer state, keyed and managed
+	// in lockstep with peers. Only accessed from the processLoop/eval
+	// goroutine. The per-entry atomics are read by writer goroutines.
+	peerTransports map[peer.ID]*peerTransport
+
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]inboundHandler
 
@@ -581,6 +586,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		myRelays:              make(map[string]int),
 		topics:                make(map[string]map[peer.ID]peerTopicState),
 		peers:                 make(map[peer.ID]*rpcQueue),
+		peerTransports:        make(map[peer.ID]*peerTransport),
 		inboundStreams:        make(map[peer.ID]inboundHandler),
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
@@ -878,6 +884,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			queue.Close()
 		}
 		p.peers = nil
+		p.peerTransports = nil
 		p.topics = nil
 		p.seenMessages.Done()
 	}()
@@ -902,6 +909,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				p.logger.Warn("closing stream for blacklisted peer", "peer", pid)
 				q.Close()
 				delete(p.peers, pid)
+				delete(p.peerTransports, pid)
 				s.Cancel()
 				s.Reset()
 				continue
@@ -913,6 +921,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 		case pid := <-p.newPeerError:
 			delete(p.peers, pid)
+			delete(p.peerTransports, pid)
 
 		case <-p.peerDead:
 			p.handleDeadPeers()
@@ -986,6 +995,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			if ok {
 				q.Close()
 				delete(p.peers, pid)
+				delete(p.peerTransports, pid)
 				p.clearPeerFromTopicsState(pid)
 				p.rt.OnClosedOutboundStream(pid)
 			}
@@ -1028,7 +1038,9 @@ func (p *PubSub) handlePendingPeers() {
 
 		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 		p.peers[pid] = rpcQueue
-		go p.handleNewPeer(p.ctx, pid, rpcQueue)
+		transport := &peerTransport{}
+		p.peerTransports[pid] = transport
+		go p.handleNewPeer(p.ctx, pid, rpcQueue, transport)
 	}
 }
 
@@ -1071,6 +1083,7 @@ func (p *PubSub) handleDeadPeers() {
 
 		q.Close()
 		delete(p.peers, pid)
+		delete(p.peerTransports, pid)
 
 		p.clearPeerFromTopicsState(pid)
 		p.rt.OnClosedOutboundStream(pid)
@@ -1087,7 +1100,9 @@ func (p *PubSub) handleDeadPeers() {
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
 			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 			p.peers[pid] = rpcQueue
-			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
+			transport := &peerTransport{}
+			p.peerTransports[pid] = transport
+			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue, transport)
 		}
 	}
 }
