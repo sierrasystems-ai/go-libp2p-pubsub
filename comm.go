@@ -100,6 +100,14 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 			}
 		}
 
+		// Tell any inbound topic-stream readers for this peer that the control
+		// stream is gone so they drop further topic messages. Done before
+		// close(done) so a replacement control stream (which waits on done)
+		// observes a consistent state.
+		if p.inboundControl != nil {
+			p.controlStreamClosed(peer)
+		}
+
 		close(done)
 	}()
 
@@ -127,6 +135,7 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 		return
 	}
 
+	helloSignaled := false
 	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
 	for {
 		// Peek at the message length to know when we should mark the start time
@@ -174,6 +183,14 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 			// Close is useless because the other side isn't reading.
 			s.Reset()
 			return
+		}
+
+		// The first control RPC carries the extensions control message. Once it
+		// is enqueued, inbound topic-stream readers may deliver topic messages
+		// (they are gated until this point so the hello is processed first).
+		if p.inboundControl != nil && !helloSignaled {
+			helloSignaled = true
+			p.controlHelloEnqueued(peer)
 		}
 	}
 }

@@ -176,6 +176,13 @@ type PubSub struct {
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]inboundHandler
 
+	// inboundControl coordinates a peer's inbound topic-stream readers with its
+	// inbound control-stream reader (so the extensions hello is processed before
+	// any topic message, and topic messages are dropped once the control stream
+	// closes). It is non-nil only when the Topic Streams extension is enabled.
+	inboundControlMx sync.Mutex
+	inboundControl   map[peer.ID]*inboundControlState
+
 	seenMessages    timecache.TimeCache
 	seenMsgTTL      time.Duration
 	seenMsgStrategy timecache.Strategy
@@ -632,6 +639,14 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 			h.SetStreamHandler(id, ps.handleNewStream)
 		}
 	}
+
+	// Register the Topic Streams inbound handler only when the extension is
+	// enabled, so peers that haven't opted in behave exactly as before.
+	if gs, ok := rt.(*GossipSubRouter); ok && gs.extensions.myExtensions.TopicStreams {
+		ps.inboundControl = make(map[peer.ID]*inboundControlState)
+		h.SetStreamHandler(TopicStreamsProtocolID, ps.handleNewTopicStream)
+	}
+
 	go ps.watchForNewPeers(ctx)
 
 	ps.val.Start(ps)
