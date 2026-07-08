@@ -19,6 +19,25 @@ const (
 	// downscore and reject further ones (topic-streams.md).
 	maxConcurrentInboundTopicStreamsPerTopic = 3
 
+	// maxConcurrentInboundTopicStreamsPerPeer bounds the total number of
+	// concurrent inbound topic streams a single peer may have open across all
+	// topics. The per-topic limit alone would let a peer hold unbounded
+	// streams (and reader goroutines) by inventing topic names.
+	maxConcurrentInboundTopicStreamsPerPeer = 256
+
+	// topicStreamHeaderTimeout is how long we wait for the initiator's
+	// TopicRPCHeader before resetting the stream. The spec suggests one second
+	// as a reasonable timeout.
+	topicStreamHeaderTimeout = time.Second
+
+	// topicStreamHelloTimeout bounds how long an inbound topic-stream reader
+	// waits for the peer's control-stream hello before giving up and resetting
+	// the stream. An honest peer only opens topic streams after extension
+	// negotiation, so its hello is already in flight; the generous bound
+	// tolerates processLoop backpressure while preventing readers from being
+	// parked forever by peers that never open a control stream.
+	topicStreamHelloTimeout = 30 * time.Second
+
 	// recentlyUnsubscribedTTL is how long we remember a topic we unsubscribed
 	// from, during which we do not penalize peers for sending us messages on it.
 	recentlyUnsubscribedTTL = 10 * time.Second
@@ -56,7 +75,8 @@ func (p *PubSub) recentlyUnsubscribedFrom(topic string) bool {
 }
 
 // acquireInboundTopicStream reserves a slot for a new inbound topic stream from
-// pid on topic, returning false if the per-topic concurrency limit is exceeded.
+// pid on topic, returning false if the per-topic or per-peer concurrency limit
+// is exceeded.
 func (p *PubSub) acquireInboundTopicStream(pid peer.ID, topic string) bool {
 	p.topicStreamCountMx.Lock()
 	defer p.topicStreamCountMx.Unlock()
@@ -69,6 +89,13 @@ func (p *PubSub) acquireInboundTopicStream(pid peer.ID, topic string) bool {
 		p.inboundTopicStreams[pid] = m
 	}
 	if m[topic] >= maxConcurrentInboundTopicStreamsPerTopic {
+		return false
+	}
+	total := 0
+	for _, n := range m {
+		total += n
+	}
+	if total >= maxConcurrentInboundTopicStreamsPerPeer {
 		return false
 	}
 	m[topic]++

@@ -93,19 +93,22 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 		}
 		p.inboundStreamsMx.Unlock()
 
+		// Tell any inbound topic-stream readers for this peer that the control
+		// stream is gone so they drop further topic messages. Done BEFORE
+		// enqueueing the closed-stream event below: once that event is queued,
+		// processLoop may clear the peer's extension state, and a topic RPC
+		// enqueued after it must not be mistaken for the peer's first (hello)
+		// RPC. Also done before close(done) so a replacement control stream
+		// (which waits on done) observes a consistent state.
+		if p.inboundControl != nil {
+			p.controlStreamClosed(peer)
+		}
+
 		if sentNewStream {
 			select {
 			case p.incoming <- incomingUnion{kind: incomingKindClosedStream, s: s}:
 			case <-p.ctx.Done():
 			}
-		}
-
-		// Tell any inbound topic-stream readers for this peer that the control
-		// stream is gone so they drop further topic messages. Done before
-		// close(done) so a replacement control stream (which waits on done)
-		// observes a consistent state.
-		if p.inboundControl != nil {
-			p.controlStreamClosed(peer)
 		}
 
 		close(done)
@@ -313,6 +316,15 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 
 		if transport != nil && transport.topicStreamsEnabled.Load() {
 			p.sendRPCOverTopicStreams(rpc, topicStreams)
+			// Per the spec's stream lifecycle, close a topic's stream when we
+			// unsubscribe from it. The unsubscribe announcement itself travels
+			// on the control stream below; closing flushes any queued topic
+			// messages first (graceful Close, not Reset).
+			for _, sub := range rpc.GetSubscriptions() {
+				if !sub.GetSubscribe() {
+					topicStreams.closeTopic(sub.GetTopicid())
+				}
+			}
 			rpc = topicStreamControlRemainder(rpc)
 			if rpc == nil {
 				continue

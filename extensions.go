@@ -121,6 +121,15 @@ func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer
 }
 
 func (es *extensionsState) HandleRPC(rpc *RPC) error {
+	if rpc.viaTopicStream {
+		// Topic-stream RPCs never carry the extensions control message. They
+		// must not be treated as a peer's first (hello) RPC — a late topic RPC
+		// racing a control-stream teardown would otherwise record an all-false
+		// extensions entry and get the peer's genuine hello on a replacement
+		// control stream reported as misbehavior.
+		return es.extensionsHandleRPC(rpc)
+	}
+
 	if _, ok := es.peerExtensions[rpc.from]; !ok {
 		// We know this is the first message because we didn't have extensions
 		// for this peer, and we always set extensions on the first rpc.

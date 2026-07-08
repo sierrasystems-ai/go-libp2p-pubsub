@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"sync"
+	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -71,9 +72,10 @@ func (p *PubSub) controlStreamClosed(pid peer.ID) {
 }
 
 // waitForHello blocks until the control hello has been enqueued or the control
-// stream has closed (or ctx is done). dropped is true when the message should
-// be dropped (the control stream is closed). ok is false when ctx was done.
-func (st *inboundControlState) waitForHello(ctx context.Context) (dropped bool, ok bool) {
+// stream has closed (or ctx is done / timeout elapses). dropped is true when
+// the message should be dropped (the control stream is closed). ok is false
+// when ctx was done or the timeout elapsed before the hello arrived.
+func (st *inboundControlState) waitForHello(ctx context.Context, timeout time.Duration) (dropped bool, ok bool) {
 	st.mu.Lock()
 	if st.helloEnqueued || st.closed {
 		dropped = st.closed
@@ -83,14 +85,35 @@ func (st *inboundControlState) waitForHello(ctx context.Context) (dropped bool, 
 	ch := st.helloCh
 	st.mu.Unlock()
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case <-ch:
 		st.mu.Lock()
 		dropped = st.closed
 		st.mu.Unlock()
 		return dropped, true
+	case <-timer.C:
+		return false, false
 	case <-ctx.Done():
 		return false, false
+	}
+}
+
+// dropInboundControlStateIfUnused removes pid's inboundControlState if it is
+// still st and no control stream ever touched it (no hello enqueued, not
+// closed). Called by topic-stream readers that gave up waiting for the hello,
+// so peers that never open a control stream cannot leak state entries (only
+// controlStreamClosed deletes entries otherwise).
+func (p *PubSub) dropInboundControlStateIfUnused(pid peer.ID, st *inboundControlState) {
+	p.inboundControlMx.Lock()
+	defer p.inboundControlMx.Unlock()
+	st.mu.Lock()
+	unused := !st.helloEnqueued && !st.closed
+	st.mu.Unlock()
+	if unused && p.inboundControl[pid] == st {
+		delete(p.inboundControl, pid)
 	}
 }
 
@@ -116,12 +139,16 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 
 	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
 
-	// The initiator MUST send a single TopicRPCHeader first.
+	// The initiator MUST send a single TopicRPCHeader first. Bound the wait so
+	// header-less streams (which are not yet counted against any limit) cannot
+	// pin a goroutine and stream indefinitely.
+	_ = s.SetReadDeadline(time.Now().Add(topicStreamHeaderTimeout))
 	hdrBytes, err := r.ReadMsg()
 	if err != nil {
 		r.ReleaseMsg(hdrBytes)
 		return
 	}
+	_ = s.SetReadDeadline(time.Time{})
 	var hdr pb.TopicRPCHeader
 	err = proto.Unmarshal(hdrBytes, &hdr)
 	r.ReleaseMsg(hdrBytes)
@@ -169,8 +196,12 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 		// frame while blocked here). Drop everything once the control stream is
 		// closed.
 		if !helloSeen {
-			dropped, ok := ctrl.waitForHello(p.ctx)
+			dropped, ok := ctrl.waitForHello(p.ctx, topicStreamHelloTimeout)
 			if !ok {
+				// Timed out (or shutting down) without ever seeing a control
+				// stream from this peer; drop the coordination state we may
+				// have created so it cannot accumulate.
+				p.dropInboundControlStateIfUnused(pid, ctrl)
 				return
 			}
 			if dropped {
@@ -194,6 +225,7 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 func topicRPCToRPC(tr *pb.TopicRPC, topic string, from peer.ID) *RPC {
 	rpc := &RPC{}
 	rpc.from = from
+	rpc.viaTopicStream = true
 	if pub := tr.GetPublish(); pub != nil {
 		rpc.Publish = []*pb.Message{topicScopedToMessage(pub, topic)}
 	}

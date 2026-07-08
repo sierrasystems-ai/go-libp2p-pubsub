@@ -3,6 +3,7 @@ package pubsub
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -98,6 +99,60 @@ func TestAcquireInboundTopicStreamLimit(t *testing.T) {
 	}
 }
 
+func TestAcquireInboundTopicStreamPerPeerCap(t *testing.T) {
+	p := &PubSub{inboundTopicStreams: make(map[peer.ID]map[string]int)}
+	pid := peer.ID("peer")
+
+	for i := 0; i < maxConcurrentInboundTopicStreamsPerPeer; i++ {
+		if !p.acquireInboundTopicStream(pid, fmt.Sprintf("t%d", i)) {
+			t.Fatalf("acquire %d should succeed", i)
+		}
+	}
+	if p.acquireInboundTopicStream(pid, "one-more") {
+		t.Fatal("acquiring beyond the per-peer cap should fail")
+	}
+	// Another peer is unaffected.
+	if !p.acquireInboundTopicStream(peer.ID("other"), "t0") {
+		t.Fatal("other peer should be allowed")
+	}
+	// Releasing a slot frees capacity for the capped peer.
+	p.releaseInboundTopicStream(pid, "t0")
+	if !p.acquireInboundTopicStream(pid, "one-more") {
+		t.Fatal("acquire after release should succeed")
+	}
+}
+
+func TestInboundControlHelloTimeout(t *testing.T) {
+	p := &PubSub{inboundControl: make(map[peer.ID]*inboundControlState)}
+	pid := peer.ID("peer")
+	st := p.inboundControlStateFor(pid)
+
+	if _, ok := st.waitForHello(context.Background(), 10*time.Millisecond); ok {
+		t.Fatal("expected waitForHello to time out")
+	}
+
+	// A state never touched by a control stream is dropped, so peers that
+	// never open a control stream cannot leak entries.
+	p.dropInboundControlStateIfUnused(pid, st)
+	p.inboundControlMx.Lock()
+	_, exists := p.inboundControl[pid]
+	p.inboundControlMx.Unlock()
+	if exists {
+		t.Fatal("expected unused inbound control state to be dropped")
+	}
+
+	// A state the control stream has touched must not be dropped.
+	st2 := p.inboundControlStateFor(pid)
+	p.controlHelloEnqueued(pid)
+	p.dropInboundControlStateIfUnused(pid, st2)
+	p.inboundControlMx.Lock()
+	_, exists = p.inboundControl[pid]
+	p.inboundControlMx.Unlock()
+	if !exists {
+		t.Fatal("state with hello enqueued must not be dropped")
+	}
+}
+
 func TestInboundControlGatingDropAfterClose(t *testing.T) {
 	p := &PubSub{inboundControl: make(map[peer.ID]*inboundControlState)}
 	pid := peer.ID("peer")
@@ -105,7 +160,7 @@ func TestInboundControlGatingDropAfterClose(t *testing.T) {
 	st := p.inboundControlStateFor(pid)
 	p.controlStreamClosed(pid)
 
-	dropped, ok := st.waitForHello(context.Background())
+	dropped, ok := st.waitForHello(context.Background(), time.Minute)
 	if !ok {
 		t.Fatal("waitForHello should not have been cancelled")
 	}
@@ -126,7 +181,7 @@ func TestInboundControlGatingHelloFirst(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		dropped, ok := st.waitForHello(context.Background())
+		dropped, ok := st.waitForHello(context.Background(), time.Minute)
 		resCh <- result{dropped, ok}
 	}()
 

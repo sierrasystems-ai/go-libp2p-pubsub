@@ -303,3 +303,49 @@ func TestPartialMessagesOverTopicStreams(t *testing.T) {
 		}
 	})
 }
+
+// TestTopicStreamsCloseOnUnsubscribe verifies that a publisher closes its
+// outbound topic stream when it unsubscribes from the topic, per the spec's
+// stream lifecycle.
+func TestTopicStreamsCloseOnUnsubscribe(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		hosts := getDefaultHosts(t, 2)
+		psubs := getGossipsubs(ctx, hosts, WithTopicStreams())
+
+		var subs []*Subscription
+		for _, ps := range psubs {
+			sub, err := ps.Subscribe("foobar")
+			if err != nil {
+				t.Fatal(err)
+			}
+			subs = append(subs, sub)
+		}
+
+		connect(t, hosts[0], hosts[1])
+		time.Sleep(2 * time.Second)
+
+		if err := psubs[0].Publish("foobar", []byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		for i, sub := range subs {
+			if _, err := sub.Next(ctx); err != nil {
+				t.Fatalf("sub %d: %v", i, err)
+			}
+		}
+
+		if !hasStreamProto(hosts[0], hosts[1].ID(), TopicStreamsProtocolID) {
+			t.Fatal("expected a topic stream after publishing")
+		}
+
+		// Unsubscribing must close the publisher's topic stream.
+		subs[0].Cancel()
+		time.Sleep(2 * time.Second)
+
+		if hasStreamProto(hosts[0], hosts[1].ID(), TopicStreamsProtocolID) {
+			t.Fatal("expected the topic stream to be closed after unsubscribe")
+		}
+	})
+}

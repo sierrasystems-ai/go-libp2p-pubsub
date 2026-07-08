@@ -323,6 +323,12 @@ type RPC struct {
 
 	// unexported on purpose, not sending this over the wire
 	from peer.ID
+
+	// viaTopicStream marks RPCs reconstructed from an inbound topic stream
+	// (TopicStreamsProtocolID) rather than read off the control stream. Such
+	// RPCs never carry the extensions control message and are subject to the
+	// topic-stream scoring rules.
+	viaTopicStream bool
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -645,20 +651,23 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 
 	rt.Attach(ps)
 
+	// Register the Topic Streams inbound handler only when the extension is
+	// enabled, so peers that haven't opted in behave exactly as before. This
+	// must happen before the control-stream handlers are registered below:
+	// their goroutines read ps.inboundControl, so assigning it afterwards
+	// would race with an early inbound stream.
+	if gs, ok := rt.(*GossipSubRouter); ok && gs.extensions.myExtensions.TopicStreams {
+		ps.inboundControl = make(map[peer.ID]*inboundControlState)
+		ps.inboundTopicStreams = make(map[peer.ID]map[string]int)
+		h.SetStreamHandler(TopicStreamsProtocolID, ps.handleNewTopicStream)
+	}
+
 	for _, id := range rt.Protocols() {
 		if ps.protoMatchFunc != nil {
 			h.SetStreamHandlerMatch(id, ps.protoMatchFunc(id), ps.handleNewStream)
 		} else {
 			h.SetStreamHandler(id, ps.handleNewStream)
 		}
-	}
-
-	// Register the Topic Streams inbound handler only when the extension is
-	// enabled, so peers that haven't opted in behave exactly as before.
-	if gs, ok := rt.(*GossipSubRouter); ok && gs.extensions.myExtensions.TopicStreams {
-		ps.inboundControl = make(map[peer.ID]*inboundControlState)
-		ps.inboundTopicStreams = make(map[peer.ID]map[string]int)
-		h.SetStreamHandler(TopicStreamsProtocolID, ps.handleNewTopicStream)
 	}
 
 	go ps.watchForNewPeers(ctx)
@@ -1295,6 +1304,11 @@ func (p *PubSub) handleRemoveRelay(topic string) {
 			p.disc.StopAdvertise(topic)
 			p.announce(topic, false)
 			p.rt.Leave(topic)
+			// Same grace window as handleRemoveSubscription: don't penalize
+			// peers that send us a message before learning we stopped relaying.
+			if p.recentlyUnsubscribed != nil {
+				p.recentlyUnsubscribed[topic] = time.Now()
+			}
 		}
 	}
 }
@@ -1520,10 +1534,12 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		for _, pmsg := range rpc.GetPublish() {
 			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
 				p.logger.Debug("received message in topic we didn't subscribe to; ignoring message")
-				// Penalize peers that send us messages for topics we are not
-				// subscribed to, unless we recently unsubscribed (the peer may
-				// not have learned of the unsubscribe yet).
-				if !p.recentlyUnsubscribedFrom(pmsg.GetTopic()) {
+				// Penalize peers that send us topic-stream messages for topics
+				// we are not subscribed to, unless we recently unsubscribed
+				// (the peer may not have learned of the unsubscribe yet). The
+				// spec scopes this downscore to topic streams; messages on the
+				// control stream are ignored as before.
+				if rpc.viaTopicStream && !p.recentlyUnsubscribedFrom(pmsg.GetTopic()) {
 					p.penalizePeer(rpc.from, unsubscribedTopicPenalty)
 				}
 				continue

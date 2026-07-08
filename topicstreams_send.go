@@ -40,14 +40,26 @@ func newTopicStreamSet(p *PubSub, ctx context.Context, pid peer.ID) *topicStream
 
 // send routes a TopicRPC to the topic's stream, opening it lazily. The first
 // frame on a freshly opened stream is the TopicRPCHeader, written by the
-// stream's own goroutine.
-func (tss *topicStreamSet) send(topic string, tr *pb.TopicRPC) {
+// stream's own goroutine. If the topic's stream died (open failure, write
+// error, peer reset), the dead entry is replaced and a fresh stream is opened
+// so a transient failure does not black-hole the topic for the lifetime of
+// the peer. Returns false if the message was dropped on a full queue.
+func (tss *topicStreamSet) send(topic string, tr *pb.TopicRPC) bool {
 	ots, ok := tss.streams[topic]
+	if ok {
+		select {
+		case <-ots.done:
+			ots.cancel()
+			delete(tss.streams, topic)
+			ok = false
+		default:
+		}
+	}
 	if !ok {
 		ots = tss.p.newOutboundTopicStream(tss.ctx, tss.pid, topic)
 		tss.streams[topic] = ots
 	}
-	ots.enqueue(tr)
+	return ots.enqueue(tr)
 }
 
 // closeTopic closes a single topic stream (e.g. on unsubscribe / leave).
@@ -68,15 +80,20 @@ type outboundTopicStream struct {
 	topic  string
 	ch     chan *pb.TopicRPC
 	cancel context.CancelFunc
+	// done is closed when the stream's writer goroutine exits, marking the
+	// entry dead so topicStreamSet.send replaces it on the next send.
+	done chan struct{}
 }
 
-func (ots *outboundTopicStream) enqueue(tr *pb.TopicRPC) {
+func (ots *outboundTopicStream) enqueue(tr *pb.TopicRPC) bool {
 	// Non-blocking: dropping on a full per-topic queue mirrors the drop-on-full
 	// behavior of the main rpcQueue and avoids head-of-line blocking the
-	// dispatcher.
+	// dispatcher. The caller traces the drop.
 	select {
 	case ots.ch <- tr:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -86,18 +103,20 @@ func (p *PubSub) newOutboundTopicStream(ctx context.Context, pid peer.ID, topic 
 		topic:  topic,
 		ch:     make(chan *pb.TopicRPC, p.peerOutboundQueueSize),
 		cancel: cancel,
+		done:   make(chan struct{}),
 	}
-	go p.runOutboundTopicStream(streamCtx, pid, topic, ots.ch)
+	go p.runOutboundTopicStream(streamCtx, pid, topic, ots)
 	return ots
 }
 
-func (p *PubSub) runOutboundTopicStream(ctx context.Context, pid peer.ID, topic string, ch chan *pb.TopicRPC) {
+func (p *PubSub) runOutboundTopicStream(ctx context.Context, pid peer.ID, topic string, ots *outboundTopicStream) {
+	defer close(ots.done)
+
 	s, err := p.host.NewStream(ctx, pid, TopicStreamsProtocolID)
 	if err != nil {
 		p.logger.Debug("failed to open topic stream", "peer", pid, "topic", topic, "err", err)
 		return
 	}
-	defer s.Reset()
 
 	// The topic stream is treated as unidirectional: the responder MUST NOT
 	// write. Watch for any data from the peer and treat it as a protocol
@@ -107,16 +126,33 @@ func (p *PubSub) runOutboundTopicStream(ctx context.Context, pid peer.ID, topic 
 	// The initiator MUST send a single TopicRPCHeader before any TopicRPC.
 	if err := p.writeProtoFrame(s, &pb.TopicRPCHeader{Topic: &topic}); err != nil {
 		p.logger.Debug("failed to write topic stream header", "peer", pid, "topic", topic, "err", err)
+		s.Reset()
 		return
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case tr := <-ch:
+			// Graceful teardown (unsubscribe or writer shutdown): flush
+			// anything already queued, then Close so in-flight frames are
+			// delivered. Reset would discard bytes the receiver has not yet
+			// read; the control-stream writer likewise Closes on exit.
+			for {
+				select {
+				case tr := <-ots.ch:
+					if err := p.writeProtoFrame(s, tr); err != nil {
+						s.Reset()
+						return
+					}
+				default:
+					s.Close()
+					return
+				}
+			}
+		case tr := <-ots.ch:
 			if err := p.writeProtoFrame(s, tr); err != nil {
 				p.logger.Debug("failed to write topic rpc", "peer", pid, "topic", topic, "err", err)
+				s.Reset()
 				return
 			}
 		}
@@ -125,14 +161,16 @@ func (p *PubSub) runOutboundTopicStream(ctx context.Context, pid peer.ID, topic 
 
 // guardTopicStreamResponder enforces the rule that the responder of a topic
 // stream MUST NOT write. Any byte read is a protocol violation; we reset the
-// stream.
+// stream. A read error is not a violation — in particular a spec-conforming
+// responder may half-close its write side (EOF), which must not tear down a
+// healthy stream.
 func (p *PubSub) guardTopicStreamResponder(s network.Stream) {
 	var b [1]byte
 	_, err := s.Read(b[:])
 	if err == nil {
 		p.logger.Warn("peer wrote on a topic stream it should only read; resetting", "peer", s.Conn().RemotePeer())
+		s.Reset()
 	}
-	s.Reset()
 }
 
 // writeProtoFrame length-prefixes and writes a single protobuf message to the
@@ -163,7 +201,10 @@ func (p *PubSub) writeProtoFrame(s network.Stream, m proto.Message) error {
 // by the caller on the control stream.
 func (p *PubSub) sendRPCOverTopicStreams(rpc *RPC, tss *topicStreamSet) {
 	for _, msg := range rpc.GetPublish() {
-		tss.send(msg.GetTopic(), &pb.TopicRPC{Publish: messageToTopicScoped(msg)})
+		if !tss.send(msg.GetTopic(), &pb.TopicRPC{Publish: messageToTopicScoped(msg)}) {
+			p.logger.Debug("dropping message: topic stream queue full", "peer", tss.pid, "topic", msg.GetTopic())
+			p.tracer.DropRPC(&RPC{RPC: pb.RPC{Publish: []*pb.Message{msg}}}, tss.pid)
+		}
 	}
 	if rpc.Partial != nil {
 		// The topicID is carried by the TopicRPCHeader and MUST be omitted on
@@ -171,7 +212,10 @@ func (p *PubSub) sendRPCOverTopicStreams(rpc *RPC, tss *topicStreamSet) {
 		partial := proto.CloneOf(rpc.Partial)
 		topic := partial.GetTopicID()
 		partial.TopicID = nil
-		tss.send(topic, &pb.TopicRPC{Partial: partial})
+		if !tss.send(topic, &pb.TopicRPC{Partial: partial}) {
+			p.logger.Debug("dropping partial message: topic stream queue full", "peer", tss.pid, "topic", topic)
+			p.tracer.DropRPC(&RPC{RPC: pb.RPC{Partial: rpc.Partial}}, tss.pid)
+		}
 	}
 }
 
