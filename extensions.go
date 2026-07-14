@@ -217,6 +217,14 @@ func (es *extensionsState) topicStreamsNegotiatedForRPC(rpc *RPC) bool {
 	return peerExtensions.TopicStreams
 }
 
+func (es *extensionsState) topicStreamsNegotiated(id peer.ID) bool {
+	if !es.myExtensions.TopicStreams || !es.peerExtensions[id].TopicStreams {
+		return false
+	}
+	_, sent := es.sentExtensions[id]
+	return sent
+}
+
 // extensionsOnClosedOutboundStream is always called after extensionsOnNewOutboundStream.
 func (es *extensionsState) extensionsOnClosedOutboundStream(id peer.ID) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {

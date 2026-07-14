@@ -160,6 +160,31 @@ func TestTopicStreamsRejectControlStreamPayloads(t *testing.T) {
 	}
 }
 
+func TestTopicStreamsRejectUnnegotiatedInboundStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getDefaultHosts(t, 2)
+	sender := getGossipsub(ctx, hosts[0])
+	_ = getGossipsub(ctx, hosts[1], WithTopicStreams())
+	connect(t, hosts[0], hosts[1])
+
+	s, err := hosts[0].NewStream(ctx, hosts[1].ID(), TopicStreamsProtocolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.writeProtoFrame(s, &pb.TopicRPCHeader{Topic: proto.String("topic")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.writeProtoFrame(s, &pb.TopicRPC{
+		Publish: &pb.TopicScopedMessage{Data: []byte("payload")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForDisconnected(t, hosts[0], hosts[1].ID())
+}
+
 // TestTopicStreamsDelivery verifies that two nodes with the Topic Streams
 // extension deliver a published message over a /gsts/v0beta stream.
 func TestTopicStreamsDelivery(t *testing.T) {

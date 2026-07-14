@@ -199,6 +199,7 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 			p.abortTopicStreamsConnection(s.Conn(), "topic RPC omitted payload")
 			return
 		}
+		rpc.conn = s.Conn()
 
 		// Ordering gate: hold this one frame until the control hello has been
 		// enqueued (buffering at most one frame, since we do not read the next

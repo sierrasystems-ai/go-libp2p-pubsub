@@ -1470,10 +1470,16 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		}
 	}
 
-	if !rpc.viaTopicStream && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
-		if gs, ok := p.rt.(*GossipSubRouter); ok && gs.extensions.topicStreamsNegotiatedForRPC(rpc) {
-			p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
+	if gs, ok := p.rt.(*GossipSubRouter); ok {
+		if rpc.viaTopicStream && !gs.extensions.topicStreamsNegotiated(rpc.from) {
+			p.abortTopicStreamsConnection(rpc.conn, "topic stream used without mutual negotiation")
 			return
+		}
+		if !rpc.viaTopicStream && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
+			if gs.extensions.topicStreamsNegotiatedForRPC(rpc) {
+				p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
+				return
+			}
 		}
 	}
 
