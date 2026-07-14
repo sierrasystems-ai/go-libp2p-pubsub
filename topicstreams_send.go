@@ -200,7 +200,9 @@ func (p *PubSub) writeProtoFrame(s network.Stream, m proto.Message) error {
 // by the caller on the control stream.
 func (p *PubSub) sendRPCOverTopicStreams(rpc *RPC, tss *topicStreamSet) {
 	for _, msg := range rpc.GetPublish() {
-		if !tss.send(msg.GetTopic(), &pb.TopicRPC{Publish: messageToTopicScoped(msg)}) {
+		if !tss.send(msg.GetTopic(), &pb.TopicRPC{
+			Payload: &pb.TopicRPC_Publish{Publish: messageToTopicScoped(msg)},
+		}) {
 			p.logger.Debug("dropping message: topic stream queue full", "peer", tss.pid, "topic", msg.GetTopic())
 			p.tracer.DropRPC(&RPC{RPC: pb.RPC{Publish: []*pb.Message{msg}}}, tss.pid)
 		}
@@ -211,7 +213,9 @@ func (p *PubSub) sendRPCOverTopicStreams(rpc *RPC, tss *topicStreamSet) {
 		partial := proto.CloneOf(rpc.Partial)
 		topic := partial.GetTopicID()
 		partial.TopicID = nil
-		if !tss.send(topic, &pb.TopicRPC{Partial: partial}) {
+		if !tss.send(topic, &pb.TopicRPC{
+			Payload: &pb.TopicRPC_Partial{Partial: partial},
+		}) {
 			p.logger.Debug("dropping partial message: topic stream queue full", "peer", tss.pid, "topic", topic)
 			p.tracer.DropRPC(&RPC{RPC: pb.RPC{Partial: rpc.Partial}}, tss.pid)
 		}

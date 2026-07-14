@@ -178,7 +178,9 @@ func TestTopicStreamsRejectUnnegotiatedInboundStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := sender.writeProtoFrame(s, &pb.TopicRPC{
-		Publish: &pb.TopicScopedMessage{Data: []byte("payload")},
+		Payload: &pb.TopicRPC_Publish{
+			Publish: &pb.TopicScopedMessage{Data: []byte("payload")},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}

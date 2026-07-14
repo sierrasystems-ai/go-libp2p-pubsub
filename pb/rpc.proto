@@ -131,6 +131,8 @@ message TopicScopedMessage {
 // TopicRPC is the length-prefixed message sent on a topic stream after the
 // TopicRPCHeader.
 message TopicRPC {
-  optional TopicScopedMessage publish = 1;
-  optional PartialMessagesExtension partial = 2;
+  oneof payload {
+    TopicScopedMessage publish = 1;
+    PartialMessagesExtension partial = 2;
+  }
 }
