@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +29,9 @@ type peerTransport struct {
 	// writer goroutine. Access is via atomics so the writer never touches
 	// router/extension state directly.
 	topicStreamsEnabled atomic.Bool
+
+	topicStreamsMx sync.Mutex
+	topicStreams   *topicStreamSet
 }
 
 // enableTopicStreams is called on the processLoop/eval goroutine once the Topic
@@ -43,6 +47,29 @@ func (p *PubSub) enableTopicStreams(pid peer.ID) {
 func (p *PubSub) disableTopicStreams(pid peer.ID) {
 	if pt, ok := p.peerTransports[pid]; ok {
 		pt.topicStreamsEnabled.Store(false)
+	}
+}
+
+func (pt *peerTransport) setTopicStreams(streams *topicStreamSet) {
+	pt.topicStreamsMx.Lock()
+	pt.topicStreams = streams
+	pt.topicStreamsMx.Unlock()
+}
+
+func (pt *peerTransport) clearTopicStreams(streams *topicStreamSet) {
+	pt.topicStreamsMx.Lock()
+	if pt.topicStreams == streams {
+		pt.topicStreams = nil
+	}
+	pt.topicStreamsMx.Unlock()
+}
+
+func (pt *peerTransport) closeTopicStream(topic string) {
+	pt.topicStreamsMx.Lock()
+	streams := pt.topicStreams
+	pt.topicStreamsMx.Unlock()
+	if streams != nil {
+		streams.closeTopic(topic)
 	}
 }
 
@@ -307,6 +334,10 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 	// ordinary RPCs and this writer splits them at send time.
 	topicStreams := newTopicStreamSet(p, ctx, s.Conn().RemotePeer())
 	defer topicStreams.close()
+	if transport != nil {
+		transport.setTopicStreams(topicStreams)
+		defer transport.clearTopicStreams(topicStreams)
+	}
 
 	for ctx.Err() == nil {
 		rpc, err := outgoing.Pop(ctx)

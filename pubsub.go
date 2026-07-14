@@ -1519,6 +1519,9 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				}
 			}
 		} else {
+			if transport := p.peerTransports[rpc.from]; transport != nil {
+				transport.closeTopicStream(t)
+			}
 			tmap, ok := p.topics[t]
 			if !ok {
 				continue

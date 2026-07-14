@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"encoding/binary"
+	"sync"
 	"time"
 
 	pool "github.com/libp2p/go-buffer-pool"
@@ -14,16 +15,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// topicStreamSet owns the outbound topic streams for a single peer. It is
-// created and used exclusively by that peer's writer goroutine
-// (handleSendingMessages), so it needs no locking. Each topic gets its own
-// stream and writer goroutine, so a slow/large message on one topic does not
-// head-of-line block other topics.
+// topicStreamSet owns the outbound topic streams for a single peer. The peer's
+// writer sends through it, while the process loop may close a stream when the
+// peer unsubscribes. Each topic gets its own stream and writer goroutine, so a
+// slow/large message on one topic does not head-of-line block other topics.
 type topicStreamSet struct {
 	p       *PubSub
 	pid     peer.ID
 	ctx     context.Context
 	cancel  context.CancelFunc
+	mu      sync.Mutex
 	streams map[string]*outboundTopicStream
 }
 
@@ -45,6 +46,9 @@ func newTopicStreamSet(p *PubSub, ctx context.Context, pid peer.ID) *topicStream
 // so a transient failure does not black-hole the topic for the lifetime of
 // the peer. Returns false if the message was dropped on a full queue.
 func (tss *topicStreamSet) send(topic string, tr *pb.TopicRPC) bool {
+	tss.mu.Lock()
+	defer tss.mu.Unlock()
+
 	ots, ok := tss.streams[topic]
 	if ok {
 		select {
@@ -64,6 +68,9 @@ func (tss *topicStreamSet) send(topic string, tr *pb.TopicRPC) bool {
 
 // closeTopic closes a single topic stream (e.g. on unsubscribe / leave).
 func (tss *topicStreamSet) closeTopic(topic string) {
+	tss.mu.Lock()
+	defer tss.mu.Unlock()
+
 	if ots, ok := tss.streams[topic]; ok {
 		ots.cancel()
 		delete(tss.streams, topic)
@@ -72,6 +79,9 @@ func (tss *topicStreamSet) closeTopic(topic string) {
 
 // close tears down every topic stream for the peer.
 func (tss *topicStreamSet) close() {
+	tss.mu.Lock()
+	defer tss.mu.Unlock()
+
 	tss.cancel()
 	tss.streams = nil
 }
