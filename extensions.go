@@ -51,31 +51,23 @@ func peerExtensionsFromRPC(rpc *RPC) PeerExtensions {
 }
 
 func (pe *PeerExtensions) ExtendRPC(rpc *RPC) *RPC {
+	// The extensions message is a capability hello, so send it even when every
+	// capability is false. Without the envelope, an otherwise empty hello has
+	// zero protobuf size and the control-stream writer skips it, leaving peers
+	// unable to distinguish "supports no extensions" from "hello not received".
+	if rpc.Control == nil {
+		rpc.Control = &pubsub_pb.ControlMessage{}
+	}
+	if rpc.Control.Extensions == nil {
+		rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
+	}
 	if pe.TestExtension {
-		if rpc.Control == nil {
-			rpc.Control = &pubsub_pb.ControlMessage{}
-		}
-		if rpc.Control.Extensions == nil {
-			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
-		}
 		rpc.Control.Extensions.TestExtension = &pe.TestExtension
 	}
 	if pe.PartialMessages {
-		if rpc.Control == nil {
-			rpc.Control = &pubsub_pb.ControlMessage{}
-		}
-		if rpc.Control.Extensions == nil {
-			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
-		}
 		rpc.Control.Extensions.PartialMessages = &pe.PartialMessages
 	}
 	if pe.TopicStreams {
-		if rpc.Control == nil {
-			rpc.Control = &pubsub_pb.ControlMessage{}
-		}
-		if rpc.Control.Extensions == nil {
-			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
-		}
 		rpc.Control.Extensions.TopicStreams = &pe.TopicStreams
 	}
 	return rpc

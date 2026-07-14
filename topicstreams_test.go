@@ -218,7 +218,11 @@ func TestTopicStreamsExtensionPlumbing(t *testing.T) {
 
 	// A peer that does not advertise topicStreams must read as disabled.
 	empty := PeerExtensions{}
-	none := peerExtensionsFromRPC(empty.ExtendRPC(&RPC{}))
+	emptyHello := empty.ExtendRPC(&RPC{})
+	if !hasPeerExtensions(emptyHello) || proto.Size(&emptyHello.RPC) == 0 {
+		t.Fatal("disabled extensions must produce an explicit capability hello")
+	}
+	none := peerExtensionsFromRPC(emptyHello)
 	if none.TopicStreams {
 		t.Fatal("expected topicStreams to be false when not advertised")
 	}
