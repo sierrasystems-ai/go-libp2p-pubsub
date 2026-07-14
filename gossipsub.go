@@ -1534,7 +1534,7 @@ func (gs *GossipSubRouter) sendPrune(p peer.ID, topic string, isUnsubscribe bool
 }
 
 func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC, urgent bool) {
-	q, ok := gs.p.peers[p]
+	q, ok := gs.p.activePeers[p]
 	if !ok {
 		// No queue to send to this peer. Nothing to do.
 		gs.doDropRPC(out, p, "No send queue for peer. Can't send RPC")
@@ -1602,12 +1602,12 @@ func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	}
 }
 
-func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bool) {
+func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *peerComm, urgent bool) {
 	var err error
 	if urgent {
-		err = q.UrgentPush(rpc, false)
+		err = q.Send(&rpc.RPC, true)
 	} else {
-		err = q.Push(rpc, false)
+		err = q.Send(&rpc.RPC, false)
 	}
 	if err != nil {
 		gs.doDropRPC(rpc, p, "queue full")

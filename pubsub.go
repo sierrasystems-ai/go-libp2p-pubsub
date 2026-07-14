@@ -54,10 +54,15 @@ type peerTopicState struct {
 	supportsPartial bool
 }
 
-type peerOutgoingStream struct {
-	network.Stream
-	FirstMessage chan *RPC
-	Cancel       context.CancelFunc
+type prepareOutboundRequest struct {
+	peer     peer.ID
+	protocol protocol.ID
+	response chan prepareOutboundResponse
+}
+
+type prepareOutboundResponse struct {
+	rpc *pb.RPC
+	ok  bool
 }
 
 // PubSub is the implementation of the pubsub system.
@@ -128,8 +133,8 @@ type PubSub struct {
 	newPeersMx     sync.Mutex
 	newPeersPend   map[peer.ID]struct{}
 
-	// a notification channel for new outoging peer streams
-	newPeerStream chan peerOutgoingStream
+	// requests to prepare the initial RPC for a new outbound stream
+	prepareOutbound chan prepareOutboundRequest
 
 	// a notification channel for errors opening new peer streams
 	newPeerError chan peer.ID
@@ -173,10 +178,13 @@ type PubSub struct {
 	blacklist     Blacklist
 	blacklistPeer chan peer.ID
 
-	peers map[peer.ID]*rpcQueue
+	// activePeers is the process-loop-owned map of peers with active outbound PubSub streams.
+	// It tracks active logical membership; peerComms is the concurrency-safe actor registry
+	// and lifetime owner, so an actor may exist there without being active here.
+	activePeers map[peer.ID]*peerComm
 
-	inboundStreamsMx sync.Mutex
-	inboundStreams   map[peer.ID]inboundHandler
+	// peerComms is the small concurrency-safe registry for per-peer communication actors.
+	peerComms *peerCommRegistry
 
 	seenMessages    timecache.TimeCache
 	seenMsgTTL      time.Duration
@@ -631,7 +639,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		incoming:              make(chan incomingUnion, 32),
 		newPeers:              make(chan struct{}, 1),
 		newPeersPend:          make(map[peer.ID]struct{}),
-		newPeerStream:         make(chan peerOutgoingStream),
+		prepareOutbound:       make(chan prepareOutboundRequest),
 		newPeerError:          make(chan peer.ID),
 		peerDead:              make(chan struct{}, 1),
 		peerDeadPend:          make(map[peer.ID]struct{}),
@@ -653,8 +661,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		mySubs:                make(map[string]map[*Subscription]struct{}),
 		myRelays:              make(map[string]int),
 		topics:                make(map[string]map[peer.ID]peerTopicState),
-		peers:                 make(map[peer.ID]*rpcQueue),
-		inboundStreams:        make(map[peer.ID]inboundHandler),
+		activePeers:           make(map[peer.ID]*peerComm),
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
 		seenMsgTTL:            TimeCacheDuration,
@@ -690,6 +697,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		return nil, err
 	}
 
+	ps.initPeerComms()
+
 	rt.Attach(ps)
 
 	for _, id := range rt.Protocols() {
@@ -699,6 +708,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 			h.SetStreamHandler(id, ps.handleNewStream)
 		}
 	}
+
 	go ps.watchForNewPeers(ctx)
 
 	ps.val.Start(ps)
@@ -956,10 +966,10 @@ func WithAppSpecificRpcInspector(inspector func(peer.ID, *RPC) error) Option {
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer func() {
 		// Clean up go routines.
-		for _, queue := range p.peers {
-			queue.Close()
+		p.activePeers = nil
+		if p.peerComms != nil {
+			p.peerComms.Stop()
 		}
-		p.peers = nil
 		p.topics = nil
 		p.seenMessages.Done()
 	}()
@@ -969,32 +979,33 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		case <-p.newPeers:
 			p.handlePendingPeers()
 
-		case s := <-p.newPeerStream:
-			pid := s.Conn().RemotePeer()
-
-			q, ok := p.peers[pid]
+		case req := <-p.prepareOutbound:
+			_, ok := p.activePeers[req.peer]
 			if !ok {
-				p.logger.Warn("new stream for unknown peer", "peer", pid)
-				s.Cancel()
-				s.Reset()
+				p.logger.Warn("new stream for unknown peer", "peer", req.peer)
+				req.response <- prepareOutboundResponse{ok: false}
 				continue
 			}
 
-			if p.blacklist.Contains(pid) {
-				p.logger.Warn("closing stream for blacklisted peer", "peer", pid)
-				q.Close()
-				delete(p.peers, pid)
-				s.Cancel()
-				s.Reset()
+			if p.blacklist.Contains(req.peer) {
+				p.logger.Warn("closing stream for blacklisted peer", "peer", req.peer)
+				delete(p.activePeers, req.peer)
+				if comm, ok := p.existingPeerComm(req.peer); ok {
+					comm.Terminate()
+				}
+				req.response <- prepareOutboundResponse{ok: false}
 				continue
 			}
 
 			helloPacket := p.getHelloPacket()
-			helloPacket = p.rt.OnNewOutboundStream(pid, s.Protocol(), helloPacket)
-			s.FirstMessage <- helloPacket
+			helloPacket = p.rt.OnNewOutboundStream(req.peer, req.protocol, helloPacket)
+			req.response <- prepareOutboundResponse{rpc: &helloPacket.RPC, ok: true}
 
 		case pid := <-p.newPeerError:
-			delete(p.peers, pid)
+			delete(p.activePeers, pid)
+			if comm, ok := p.existingPeerComm(pid); ok {
+				comm.Terminate()
+			}
 
 		case <-p.peerDead:
 			p.handleDeadPeers()
@@ -1024,7 +1035,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				continue
 			}
 			var peers []peer.ID
-			for p := range p.peers {
+			for p := range p.activePeers {
 				if preq.topic != "" {
 					_, ok := tmap[p]
 					if !ok {
@@ -1064,10 +1075,12 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.logger.Info("Blacklisting peer", "peer", pid)
 			p.blacklist.Add(pid)
 
-			q, ok := p.peers[pid]
+			_, ok := p.activePeers[pid]
 			if ok {
-				q.Close()
-				delete(p.peers, pid)
+				delete(p.activePeers, pid)
+				if comm, ok := p.existingPeerComm(pid); ok {
+					comm.Terminate()
+				}
 				p.clearPeerFromTopicsState(pid)
 				p.rt.OnClosedOutboundStream(pid)
 			}
@@ -1098,7 +1111,7 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		if _, ok := p.peers[pid]; ok {
+		if _, ok := p.activePeers[pid]; ok {
 			p.logger.Debug("already have connection to peer", "peer", pid)
 			continue
 		}
@@ -1108,9 +1121,9 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
-		p.peers[pid] = rpcQueue
-		go p.handleNewPeer(p.ctx, pid, rpcQueue)
+		comm := p.peerComms.For(pid)
+		p.activePeers[pid] = comm
+		comm.Start(0)
 	}
 }
 
@@ -1146,13 +1159,12 @@ func (p *PubSub) handleDeadPeers() {
 	p.peerDeadPrioLk.Unlock()
 
 	for pid := range deadPeers {
-		q, ok := p.peers[pid]
+		_, ok := p.activePeers[pid]
 		if !ok {
 			continue
 		}
 
-		q.Close()
-		delete(p.peers, pid)
+		delete(p.activePeers, pid)
 
 		p.clearPeerFromTopicsState(pid)
 		p.rt.OnClosedOutboundStream(pid)
@@ -1167,9 +1179,9 @@ func (p *PubSub) handleDeadPeers() {
 			// still connected, must be a duplicate connection being closed.
 			// we respawn the writer as we need to ensure there is a stream active
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
-			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
-			p.peers[pid] = rpcQueue
-			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
+			comm := p.peerComms.For(pid)
+			p.activePeers[pid] = comm
+			comm.Start(backoffDelay)
 		}
 	}
 }
@@ -1351,8 +1363,8 @@ func (p *PubSub) announce(topic string, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	for pid, peer := range p.peers {
-		err := peer.Push(out, false)
+	for pid, peer := range p.activePeers {
+		err := peer.Send(&out.RPC, false)
 		if err != nil {
 			p.logger.Info("Can't send announce message to peer: queue full; scheduling retry", "peer", pid)
 			p.tracer.DropRPC(out, pid)
@@ -1384,7 +1396,7 @@ func (p *PubSub) announceRetry(pid peer.ID, topic string, sub bool) {
 }
 
 func (p *PubSub) doAnnounceRetry(pid peer.ID, topic string, sub bool) {
-	peer, ok := p.peers[pid]
+	peer, ok := p.activePeers[pid]
 	if !ok {
 		return
 	}
@@ -1405,7 +1417,7 @@ func (p *PubSub) doAnnounceRetry(pid peer.ID, topic string, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	err := peer.Push(out, false)
+	err := peer.Send(&out.RPC, false)
 	if err != nil {
 		p.logger.Info("Can't send announce message to peer: queue full; scheduling retry", "peer", pid)
 		p.tracer.DropRPC(out, pid)
@@ -1477,6 +1489,7 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 }
 
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
+
 	// pass the rpc through app specific validation (if any available).
 	if p.appSpecificRpcInspector != nil {
 		// check if the RPC is allowed by the external inspector

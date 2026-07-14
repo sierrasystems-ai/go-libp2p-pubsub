@@ -192,7 +192,7 @@ func TestNoLeakFromDisconnectedPeer(t *testing.T) {
 			}
 		}
 		waitForCond("peer added", func() bool {
-			_, inPeers := ps.peers[remoteHost.ID()]
+			_, inPeers := ps.activePeers[remoteHost.ID()]
 			_, inRouter := gs.peers[remoteHost.ID()]
 			return inPeers && inRouter
 		})
@@ -204,9 +204,9 @@ func TestNoLeakFromDisconnectedPeer(t *testing.T) {
 
 		// Wait for the local to fully remove the peer. handleDeadPeers removes
 		// it, tries to reconnect (fails because handler is gone), and newPeerError
-		// cleans up ps.peers.
+		// cleans up ps.activePeers.
 		waitForCond("peer removed", func() bool {
-			_, inPeers := ps.peers[remoteHost.ID()]
+			_, inPeers := ps.activePeers[remoteHost.ID()]
 			_, inGossipsub := gs.peers[remoteHost.ID()]
 			return !inPeers && !inGossipsub
 		})
@@ -233,15 +233,15 @@ func TestNoLeakFromDisconnectedPeer(t *testing.T) {
 		time.Sleep(time.Second)
 
 		// --- Step 4: Observe leaked state. ---
-		// The peer is not in ps.peers (it was removed and the reconnect failed),
+		// The peer is not in ps.activePeers (it was removed and the reconnect failed),
 		// but the stale RPC re-added it to ps.topics. Since the peer is not in
-		// ps.peers, handleDeadPeers will never clean it up — it checks ps.peers
+		// ps.activePeers, handleDeadPeers will never clean it up — it checks ps.activePeers
 		// first and skips unknown peers. This is permanently leaked state.
 		checkDone := make(chan struct{})
 		ps.eval <- func() {
 			defer close(checkDone)
 
-			_, inPeers := ps.peers[remoteHost.ID()]
+			_, inPeers := ps.activePeers[remoteHost.ID()]
 			_, inTopics := ps.topics[topic][remoteHost.ID()]
 
 			if inPeers || inTopics {
