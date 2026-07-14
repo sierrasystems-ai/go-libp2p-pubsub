@@ -47,6 +47,27 @@ func waitForDisconnected(t *testing.T, h host.Host, pid peer.ID) {
 	t.Fatalf("peer %s remained connected after protocol violation", pid)
 }
 
+func waitForTopicStreamsEnabled(t *testing.T, ps *PubSub, pid peer.ID) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		enabled := make(chan bool, 1)
+		select {
+		case ps.eval <- func() {
+			transport := ps.peerTransports[pid]
+			enabled <- transport != nil && transport.topicStreamsEnabled.Load()
+		}:
+		case <-ps.ctx.Done():
+			t.Fatal(ps.ctx.Err())
+		}
+		if <-enabled {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("topic streams were not negotiated with peer %s", pid)
+}
+
 func TestTopicStreamProtocolViolationsCloseConnection(t *testing.T) {
 	tests := []struct {
 		name string
@@ -83,6 +104,54 @@ func TestTopicStreamProtocolViolationsCloseConnection(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := tc.send(psubs[0], s); err != nil {
+				t.Fatal(err)
+			}
+
+			waitForDisconnected(t, hosts[0], hosts[1].ID())
+		})
+	}
+}
+
+func TestTopicStreamsRejectControlStreamPayloads(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload func(*pb.RPC)
+	}{
+		{
+			name: "publish",
+			payload: func(rpc *pb.RPC) {
+				rpc.Publish = []*pb.Message{{Topic: proto.String("topic"), Data: []byte("payload")}}
+			},
+		},
+		{
+			name: "partial",
+			payload: func(rpc *pb.RPC) {
+				rpc.Partial = &pb.PartialMessagesExtension{TopicID: proto.String("topic")}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			hosts := getDefaultHosts(t, 2)
+			psubs := getGossipsubs(ctx, hosts, WithTopicStreams())
+			connect(t, hosts[0], hosts[1])
+			waitForTopicStreamsEnabled(t, psubs[1], hosts[0].ID())
+
+			s, err := hosts[0].NewStream(ctx, hosts[1].ID(), GossipSubID_v13)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rpc := &pb.RPC{
+				Control: &pb.ControlMessage{
+					Extensions: &pb.ControlExtensions{TopicStreams: proto.Bool(true)},
+				},
+			}
+			tc.payload(rpc)
+			if err := psubs[0].writeProtoFrame(s, rpc); err != nil {
 				t.Fatal(err)
 			}
 

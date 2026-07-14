@@ -198,6 +198,25 @@ func (es *extensionsState) extensionsOnNewOutboundStream(id peer.ID) {
 	}
 }
 
+// topicStreamsNegotiatedForRPC reports whether the peer and local node have
+// both advertised Topic Streams by the time rpc is processed. For a peer's
+// first RPC, use the advertisement carried by that RPC before HandleRPC stores
+// it, so an application payload cannot ride alongside the negotiation hello on
+// the control stream.
+func (es *extensionsState) topicStreamsNegotiatedForRPC(rpc *RPC) bool {
+	if !es.myExtensions.TopicStreams {
+		return false
+	}
+	if _, sent := es.sentExtensions[rpc.from]; !sent {
+		return false
+	}
+	peerExtensions, known := es.peerExtensions[rpc.from]
+	if !known {
+		peerExtensions = peerExtensionsFromRPC(rpc)
+	}
+	return peerExtensions.TopicStreams
+}
+
 // extensionsOnClosedOutboundStream is always called after extensionsOnNewOutboundStream.
 func (es *extensionsState) extensionsOnClosedOutboundStream(id peer.ID) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {

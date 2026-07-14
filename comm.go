@@ -177,6 +177,7 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 		p.rpcLogger.Debug("received", "peer", s.Conn().RemotePeer(), "duration_s", timeToReceive.Seconds(), "rpc", rpc)
 
 		rpc.from = peer
+		rpc.conn = s.Conn()
 		select {
 		case p.incoming <- incomingUnion{
 			kind: incomingKindRPC,

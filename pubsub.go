@@ -323,6 +323,9 @@ type RPC struct {
 
 	// unexported on purpose, not sending this over the wire
 	from peer.ID
+	// conn identifies the connection that delivered an inbound control-stream
+	// RPC so protocol violations can close that exact connection.
+	conn network.Conn
 
 	// viaTopicStream marks RPCs reconstructed from an inbound topic stream
 	// (TopicStreamsProtocolID) rather than read off the control stream. Such
@@ -1464,6 +1467,13 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		if err := p.appSpecificRpcInspector(rpc.from, rpc); err != nil {
 			p.logger.Debug("application-specific inspection failed, rejecting incoming rpc", "err", err)
 			return // reject the RPC
+		}
+	}
+
+	if !rpc.viaTopicStream && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
+		if gs, ok := p.rt.(*GossipSubRouter); ok && gs.extensions.topicStreamsNegotiatedForRPC(rpc) {
+			p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
+			return
 		}
 	}
 
