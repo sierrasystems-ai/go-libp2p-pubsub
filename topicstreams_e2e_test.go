@@ -36,16 +36,16 @@ func hasStreamProto(h host.Host, pid peer.ID, proto protocol.ID) bool {
 	return countStreamProto(h, pid, proto) > 0
 }
 
-func waitForDisconnected(t *testing.T, h host.Host, pid peer.ID) {
+func waitForConnectionClosed(t *testing.T, conn network.Conn) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if h.Network().Connectedness(pid) == network.NotConnected {
+		if conn.IsClosed() {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("peer %s remained connected after protocol violation", pid)
+	t.Fatalf("connection to peer %s remained open after protocol violation", conn.RemotePeer())
 }
 
 func waitForTopicStreamsEnabled(t *testing.T, ps *PubSub, pid peer.ID) {
@@ -108,7 +108,7 @@ func TestTopicStreamProtocolViolationsCloseConnection(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			waitForDisconnected(t, hosts[0], hosts[1].ID())
+			waitForConnectionClosed(t, s.Conn())
 		})
 	}
 }
@@ -156,7 +156,7 @@ func TestTopicStreamsRejectControlStreamPayloads(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			waitForDisconnected(t, hosts[0], hosts[1].ID())
+			waitForConnectionClosed(t, s.Conn())
 		})
 	}
 }
@@ -185,7 +185,7 @@ func TestTopicStreamsRejectUnnegotiatedInboundStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForDisconnected(t, hosts[0], hosts[1].ID())
+	waitForConnectionClosed(t, s.Conn())
 }
 
 // TestTopicStreamsDelivery verifies that two nodes with the Topic Streams
