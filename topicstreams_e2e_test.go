@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -375,6 +376,15 @@ func TestPartialMessagesOverTopicStreams(t *testing.T) {
 		for i := range hostCount {
 			partialMessageStore[i] = make(map[string]*minimalTestPartialMessage)
 		}
+		completed := make(chan int, hostCount)
+		completedOnce := make([]sync.Once, hostCount)
+		markComplete := func(i int, pm *minimalTestPartialMessage) {
+			if pm.complete() {
+				completedOnce[i].Do(func() {
+					completed <- i
+				})
+			}
+		}
 
 		for i := range partialExt {
 			partialExt[i] = &partialmessages.PartialMessagesExtension[peerState]{
@@ -403,6 +413,7 @@ func TestPartialMessagesOverTopicStreams(t *testing.T) {
 						peerState.sent = bitmap.Merge(peerState.sent, pm.PartsMetadata())
 					}
 					peerStates[from] = peerState
+					markComplete(i, pm)
 					if shouldRepublish {
 						go PublishPartial(psubs[i], topic, pm.GroupID(), pm.publishActions)
 					}
@@ -435,24 +446,23 @@ func TestPartialMessagesOverTopicStreams(t *testing.T) {
 			Parts: [2][]byte{[]byte("Hello"), []byte("World")},
 		}
 		partialMessageStore[0][topic+string(group)] = msg1
+		markComplete(0, msg1)
 		if err := PublishPartial(psubs[0], topic, msg1.GroupID(), msg1.publishActions); err != nil {
 			t.Fatal(err)
 		}
 
-		time.Sleep(2 * time.Second)
-		closeGossipsub()
-		time.Sleep(time.Second)
-
-		for i, msgStore := range partialMessageStore {
-			if len(msgStore) == 0 {
-				t.Errorf("Host %d is missing the partial message", i)
-			}
-			for _, pm := range msgStore {
-				if !pm.complete() {
-					t.Errorf("host %d: expected complete message, but %v is incomplete", i, pm)
-				}
+		completeHosts := make(map[int]struct{}, hostCount)
+		for len(completeHosts) < hostCount {
+			select {
+			case i := <-completed:
+				completeHosts[i] = struct{}{}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for complete partial messages; completed hosts: %v", completeHosts)
 			}
 		}
+
+		closeGossipsub()
+		time.Sleep(time.Second)
 	})
 }
 
