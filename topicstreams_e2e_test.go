@@ -13,8 +13,10 @@ import (
 	"github.com/libp2p/go-libp2p-pubsub/partialmessages/bitmap"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 func countStreamProto(h host.Host, pid peer.ID, proto protocol.ID) int {
@@ -31,6 +33,62 @@ func countStreamProto(h host.Host, pid peer.ID, proto protocol.ID) int {
 
 func hasStreamProto(h host.Host, pid peer.ID, proto protocol.ID) bool {
 	return countStreamProto(h, pid, proto) > 0
+}
+
+func waitForDisconnected(t *testing.T, h host.Host, pid peer.ID) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.Network().Connectedness(pid) == network.NotConnected {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("peer %s remained connected after protocol violation", pid)
+}
+
+func TestTopicStreamProtocolViolationsCloseConnection(t *testing.T) {
+	tests := []struct {
+		name string
+		send func(*PubSub, network.Stream) error
+	}{
+		{
+			name: "missing topic",
+			send: func(ps *PubSub, s network.Stream) error {
+				return ps.writeProtoFrame(s, &pb.TopicRPCHeader{})
+			},
+		},
+		{
+			name: "empty RPC",
+			send: func(ps *PubSub, s network.Stream) error {
+				if err := ps.writeProtoFrame(s, &pb.TopicRPCHeader{Topic: proto.String("topic")}); err != nil {
+					return err
+				}
+				return ps.writeProtoFrame(s, &pb.TopicRPC{})
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			hosts := getDefaultHosts(t, 2)
+			psubs := getGossipsubs(ctx, hosts, WithTopicStreams())
+			connect(t, hosts[0], hosts[1])
+
+			s, err := hosts[0].NewStream(ctx, hosts[1].ID(), TopicStreamsProtocolID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.send(psubs[0], s); err != nil {
+				t.Fatal(err)
+			}
+
+			waitForDisconnected(t, hosts[0], hosts[1].ID())
+		})
+	}
 }
 
 // TestTopicStreamsDelivery verifies that two nodes with the Topic Streams

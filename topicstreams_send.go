@@ -166,10 +166,9 @@ func (p *PubSub) runOutboundTopicStream(ctx context.Context, pid peer.ID, topic 
 // healthy stream.
 func (p *PubSub) guardTopicStreamResponder(s network.Stream) {
 	var b [1]byte
-	_, err := s.Read(b[:])
-	if err == nil {
-		p.logger.Warn("peer wrote on a topic stream it should only read; resetting", "peer", s.Conn().RemotePeer())
-		s.Reset()
+	n, _ := s.Read(b[:])
+	if n > 0 {
+		p.abortTopicStreamsConnection(s.Conn(), "topic stream responder wrote data")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"google.golang.org/protobuf/proto"
@@ -12,6 +13,8 @@ import (
 // TopicStreamsProtocolID is the protocol ID used for topic streams. See the
 // Topic Streams extension spec (topic-streams.md).
 const TopicStreamsProtocolID = protocol.ID("/gsts/v0beta")
+
+const topicStreamsProtocolViolationError = network.ConnErrorCode(0xd52505)
 
 const (
 	// maxConcurrentInboundTopicStreamsPerTopic is the number of concurrent
@@ -50,6 +53,13 @@ const (
 	// opens more than the allowed number of concurrent topic streams per topic.
 	tooManyTopicStreamsPenalty = 1
 )
+
+func (p *PubSub) abortTopicStreamsConnection(conn network.Conn, reason string) {
+	p.logger.Warn("topic streams protocol violation; closing connection", "peer", conn.RemotePeer(), "reason", reason)
+	if err := conn.CloseWithError(topicStreamsProtocolViolationError); err != nil {
+		p.logger.Debug("failed to close connection after topic streams protocol violation", "peer", conn.RemotePeer(), "err", err)
+	}
+}
 
 // penalizePeer applies a behavior penalty to a peer via the gossipsub scoring
 // subsystem. It is a no-op when the router is not gossipsub or scoring is

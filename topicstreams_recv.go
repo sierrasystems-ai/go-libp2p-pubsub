@@ -154,9 +154,14 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 	r.ReleaseMsg(hdrBytes)
 	if err != nil {
 		p.logger.Debug("bogus topic stream header", "peer", pid, "err", err)
+		p.abortTopicStreamsConnection(s.Conn(), "malformed topic stream header")
 		return
 	}
 	topic := hdr.GetTopic()
+	if topic == "" {
+		p.abortTopicStreamsConnection(s.Conn(), "topic stream header omitted topic")
+		return
+	}
 
 	// Enforce the per-(peer, topic) concurrency limit.
 	if !p.acquireInboundTopicStream(pid, topic) {
@@ -176,19 +181,23 @@ func (p *PubSub) handleNewTopicStream(s network.Stream) {
 			return
 		}
 		if len(msgbytes) == 0 {
-			continue
+			r.ReleaseMsg(msgbytes)
+			p.abortTopicStreamsConnection(s.Conn(), "empty topic RPC")
+			return
 		}
 		var tr pb.TopicRPC
 		err = proto.Unmarshal(msgbytes, &tr)
 		r.ReleaseMsg(msgbytes)
 		if err != nil {
 			p.logger.Debug("bogus topic rpc", "peer", pid, "err", err)
+			p.abortTopicStreamsConnection(s.Conn(), "malformed topic RPC")
 			return
 		}
 
 		rpc := topicRPCToRPC(&tr, topic, pid)
 		if rpc == nil {
-			continue
+			p.abortTopicStreamsConnection(s.Conn(), "topic RPC omitted payload")
+			return
 		}
 
 		// Ordering gate: hold this one frame until the control hello has been
