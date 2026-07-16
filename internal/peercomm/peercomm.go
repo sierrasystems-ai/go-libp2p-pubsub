@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/libp2p/go-libp2p-pubsub/internal/topicstreams"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -31,11 +32,20 @@ const (
 // Generation is an opaque token identifying one actor-owned stream generation.
 type Generation struct{ value uint64 }
 
+// Admission is an opaque token for an admitted inbound topic stream.
+type Admission struct {
+	id, generation uint64
+	accepted       bool
+}
+
+func (a Admission) Accepted() bool { return a.accepted }
+
 // InboundEventKind describes serialized inbound communication events.
 type InboundEventKind uint8
 
 const (
 	InboundRPC InboundEventKind = iota
+	InboundTopicRPC
 	InboundControlOpened
 	InboundControlClosed
 )
@@ -49,19 +59,25 @@ type InboundEvent struct {
 
 // Hooks are callbacks into the embedding PubSub service.
 type Hooks struct {
-	Protocols          func() []protocol.ID
-	PrepareHello       func(context.Context, peer.ID, protocol.ID) (*pb.RPC, bool)
-	OutboundOpenFailed func(peer.ID)
-	OutboundDead       func(peer.ID)
-	EmitInbound        func(peer.ID, InboundEvent) bool
+	Protocols            func() []protocol.ID
+	PrepareHello         func(context.Context, peer.ID, protocol.ID) (*pb.RPC, bool)
+	OutboundOpenFailed   func(peer.ID)
+	OutboundDead         func(peer.ID)
+	EmitInbound          func(peer.ID, InboundEvent) bool
+	PenalizeInboundLimit func(peer.ID)
 }
 
 type Config struct {
-	Host                  host.Host
-	OutboundQueueSize     int
-	MaxMessageSize        int
-	MaxControlMessageSize int
-	Logger                *slog.Logger
+	Host                      host.Host
+	OutboundQueueSize         int
+	MaxMessageSize            int
+	MaxControlMessageSize     int
+	MaxInboundStreamsPerTopic int
+	MaxInboundStreamsPerPeer  int
+	FirstControlTimeout       time.Duration
+	Logger                    *slog.Logger
+	TopicStreamsHooks         topicstreams.OutboundHooks
+	TopicStreamViolation      func(network.Conn, string)
 }
 
 type Registry struct {
@@ -136,14 +152,17 @@ func (r *Registry) Stop() {
 }
 
 type Actor struct {
-	registry *Registry
-	peer     peer.ID
-	events   chan any
-	done     chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	queue    *rpcQueue
-	started  atomic.Bool
+	registry            *Registry
+	peer                peer.ID
+	events              chan any
+	done                chan struct{}
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	queue               *rpcQueue
+	started             atomic.Bool
+	outMu               sync.Mutex
+	outbound            *outboundSession
+	topicStreamsEnabled bool
 }
 type inboundControlOpen struct {
 	stream network.Stream
@@ -157,7 +176,32 @@ type inboundControlClose struct {
 	generation Generation
 	stream     network.Stream
 }
+type inboundTopicOpen struct {
+	stream network.Stream
+	topic  string
+	reply  chan Admission
+}
+type inboundTopicRPC struct {
+	admission Admission
+	rpc       *pb.RPC
+	reply     chan bool
+	deadline  time.Time
+}
+type inboundTopicClose struct{ admission Admission }
+
+type cancelPendingInboundTopicRPC struct {
+	admission Admission
+	reply     chan bool
+	ack       chan struct{}
+}
 type stop struct{ done chan struct{} }
+type inboundTopic struct {
+	stream     network.Stream
+	topic      string
+	generation uint64
+	pending    *inboundTopicRPC
+}
+type outboundSession struct{ topics *topicstreams.OutboundStreams }
 
 func (a *Actor) submit(ev any) bool {
 	select {
@@ -194,11 +238,77 @@ func (a *Actor) DeliverInboundControl(g Generation, r *pb.RPC) {
 func (a *Actor) CloseInboundControl(g Generation, s network.Stream) {
 	a.submit(inboundControlClose{g, s})
 }
+func (a *Actor) OpenInboundTopic(s network.Stream, topic string) Admission {
+	ch := make(chan Admission, 1)
+	if !a.submit(inboundTopicOpen{s, topic, ch}) {
+		return Admission{}
+	}
+	select {
+	case x := <-ch:
+		return x
+	case <-a.done:
+		return Admission{}
+	case <-a.ctx.Done():
+		return Admission{}
+	}
+}
+func (a *Actor) DeliverInboundTopic(ad Admission, r *pb.RPC) bool {
+	ch := make(chan bool, 1)
+	timeout := a.registry.config.FirstControlTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if !a.submit(inboundTopicRPC{ad, r, ch, time.Now().Add(timeout)}) {
+		return false
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case ok := <-ch:
+		return ok
+	case <-t.C:
+		ack := make(chan struct{})
+		if a.submit(cancelPendingInboundTopicRPC{ad, ch, ack}) {
+			select {
+			case <-ack:
+			case <-a.done:
+			case <-a.ctx.Done():
+			}
+		}
+		return false
+	case <-a.done:
+		return false
+	case <-a.ctx.Done():
+		return false
+	}
+}
+func (a *Actor) CloseInboundTopic(ad Admission) { a.submit(inboundTopicClose{ad}) }
 func (a *Actor) Terminate() {
 	a.registry.remove(a.peer, a)
 	a.queue.close()
 	a.cancel()
 }
+func (a *Actor) SetTopicStreamsEnabled(enabled bool) {
+	a.outMu.Lock()
+	a.topicStreamsEnabled = enabled
+	a.outMu.Unlock()
+}
+
+// TopicStreamsEnabled reports the actor's negotiated outbound routing state.
+func (a *Actor) TopicStreamsEnabled() bool {
+	a.outMu.Lock()
+	defer a.outMu.Unlock()
+	return a.topicStreamsEnabled
+}
+func (a *Actor) RemoteUnsubscribed(topic string) {
+	a.outMu.Lock()
+	out := a.outbound
+	a.outMu.Unlock()
+	if out != nil && out.topics != nil {
+		out.topics.CloseTopic(topic)
+	}
+}
+
 func (a *Actor) Stop() bool {
 	ack := make(chan struct{})
 	t := time.NewTimer(stopTimeout)
@@ -227,23 +337,41 @@ func (a *Actor) run() {
 	defer a.queue.close()
 	var control network.Stream
 	var controlSet bool
-	var controlGen uint64
+	var controlGen, nextTopicID uint64
+	firstControl := false
+	topics := make(map[uint64]*inboundTopic)
+	counts := make(map[string]int)
+	total := 0
 	emit := func(ev InboundEvent) bool {
 		if a.registry.hooks.EmitInbound == nil {
 			return true
 		}
 		return a.registry.hooks.EmitInbound(a.peer, ev)
 	}
+	closeTopics := func() {
+		for _, t := range topics {
+			t.stream.Reset()
+			if t.pending != nil {
+				t.pending.reply <- false
+			}
+		}
+		topics = make(map[uint64]*inboundTopic)
+		counts = make(map[string]int)
+		total = 0
+	}
+	closeOutbound := func() { a.closeOutbound() }
 	retire := func() bool {
-		if controlSet || a.started.Load() {
+		if controlSet || len(topics) > 0 || a.started.Load() {
 			return false
 		}
 		return a.registry.remove(a.peer, a)
 	}
 	shutdown := func() {
 		if controlSet {
-			_ = control.Reset()
+			control.Reset()
 		}
+		closeTopics()
+		closeOutbound()
 	}
 	for {
 		select {
@@ -251,12 +379,19 @@ func (a *Actor) run() {
 			switch ev := raw.(type) {
 			case inboundControlOpen:
 				if controlSet && control != ev.stream {
-					_ = control.Reset()
+					control.Reset()
+					closeTopics()
 					emit(InboundEvent{Kind: InboundControlClosed, Stream: control})
 				}
 				controlGen++
 				control = ev.stream
 				controlSet = true
+				firstControl = false
+				for _, t := range topics {
+					if t.generation == 0 {
+						t.generation = controlGen
+					}
+				}
 				emit(InboundEvent{Kind: InboundControlOpened, Stream: ev.stream})
 				ev.reply <- Generation{controlGen}
 			case inboundControlRPC:
@@ -267,12 +402,98 @@ func (a *Actor) run() {
 					shutdown()
 					return
 				}
+				if !firstControl {
+					firstControl = true
+					for _, t := range topics {
+						if t.generation == controlGen && t.pending != nil {
+							ok := false
+							if time.Now().Before(t.pending.deadline) {
+								ok = emit(InboundEvent{Kind: InboundTopicRPC, RPC: t.pending.rpc, Stream: t.stream})
+							}
+							t.pending.reply <- ok
+							t.pending = nil
+						}
+					}
+				}
 			case inboundControlClose:
 				if ev.generation.value != controlGen || !controlSet || control != ev.stream {
 					continue
 				}
+				closeTopics()
 				emit(InboundEvent{Kind: InboundControlClosed, Stream: ev.stream})
 				controlSet = false
+				firstControl = false
+				if retire() {
+					return
+				}
+			case inboundTopicOpen:
+				if counts[ev.topic] >= a.registry.config.MaxInboundStreamsPerTopic || total >= a.registry.config.MaxInboundStreamsPerPeer {
+					ev.reply <- Admission{}
+					if a.registry.hooks.PenalizeInboundLimit != nil {
+						a.registry.hooks.PenalizeInboundLimit(a.peer)
+					}
+					continue
+				}
+				nextTopicID++
+				g := controlGen
+				if !controlSet {
+					g = 0
+				}
+				topics[nextTopicID] = &inboundTopic{stream: ev.stream, topic: ev.topic, generation: g}
+				counts[ev.topic]++
+				total++
+				ev.reply <- Admission{id: nextTopicID, generation: g, accepted: true}
+			case inboundTopicRPC:
+				t := topics[ev.admission.id]
+				if t == nil || (ev.admission.generation != 0 && t.generation != ev.admission.generation) {
+					ev.reply <- false
+					continue
+				}
+				if !controlSet {
+					if t.pending != nil {
+						ev.reply <- false
+					} else {
+						t.pending = &ev
+					}
+					continue
+				}
+				if t.generation == 0 {
+					t.generation = controlGen
+				}
+				if t.generation != controlGen {
+					ev.reply <- false
+					continue
+				}
+				if !firstControl {
+					if t.pending != nil {
+						ev.reply <- false
+					} else {
+						t.pending = &ev
+					}
+					continue
+				}
+				if time.Now().Before(ev.deadline) {
+					ev.reply <- emit(InboundEvent{Kind: InboundTopicRPC, RPC: ev.rpc, Stream: t.stream})
+				} else {
+					ev.reply <- false
+				}
+			case cancelPendingInboundTopicRPC:
+				t := topics[ev.admission.id]
+				if t != nil && (ev.admission.generation == 0 || t.generation == ev.admission.generation) && t.pending != nil && t.pending.reply == ev.reply {
+					t.pending = nil
+				}
+				close(ev.ack)
+			case inboundTopicClose:
+				t := topics[ev.admission.id]
+				if t == nil || (ev.admission.generation != 0 && t.generation != ev.admission.generation) {
+					continue
+				}
+				if t.pending != nil {
+					t.pending.reply <- false
+				}
+				delete(topics, ev.admission.id)
+				counts[t.topic]--
+				total--
 				if retire() {
 					return
 				}
@@ -392,6 +613,28 @@ func (a *Actor) Start(backoff time.Duration) {
 	}()
 }
 
+// HandleInboundTopicStream owns the complete inbound topic-stream lifecycle.
+func (a *Actor) HandleInboundTopicStream(s network.Stream) {
+	var admission Admission
+	topicstreams.HandleInbound(s, a.registry.config.MaxMessageSize, topicstreams.InboundHooks{
+		Admit: func(s network.Stream, topic string) bool {
+			admission = a.OpenInboundTopic(s, topic)
+			return admission.Accepted()
+		},
+		Deliver: func(envelope topicstreams.Envelope) bool {
+			rpc := new(pb.RPC)
+			if envelope.Publish != nil {
+				rpc.Publish = []*pb.Message{envelope.Publish}
+			}
+			rpc.Partial = envelope.Partial
+			return a.DeliverInboundTopic(admission, rpc)
+		},
+		Close:     func() { a.CloseInboundTopic(admission) },
+		Logger:    a.registry.config.Logger,
+		Violation: a.registry.config.TopicStreamViolation,
+	})
+}
+
 // HandleInboundControl owns the complete inbound control-stream read lifecycle.
 func (a *Actor) HandleInboundControl(s network.Stream) {
 	g, ok := a.OpenInboundControl(s)
@@ -453,7 +696,10 @@ func (a *Actor) runOutbound() {
 	opened = true
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()
-	defer func() { _ = s.Close() }()
+	defer func() {
+		a.closeOutbound()
+		_ = s.Close()
+	}()
 	hello, ok := h.PrepareHello(ctx, a.peer, s.Protocol())
 	if !ok {
 		_ = s.Reset()
@@ -465,6 +711,9 @@ func (a *Actor) runOutbound() {
 			return
 		}
 	}
+	a.outMu.Lock()
+	a.outbound = &outboundSession{topics: topicstreams.NewOutboundStreams(ctx, a.registry.config.Host, a.peer, a.registry.config.OutboundQueueSize, a.registry.config.Logger, a.registry.config.TopicStreamsHooks)}
+	a.outMu.Unlock()
 	go func() {
 		_, e := s.Read([]byte{0})
 		if e == nil {
@@ -478,10 +727,30 @@ func (a *Actor) runOutbound() {
 		if e != nil {
 			return
 		}
+		a.outMu.Lock()
+		out := a.outbound
+		enabled := a.topicStreamsEnabled
+		a.outMu.Unlock()
+		if enabled && out != nil {
+			rpc = out.topics.RouteRPC(rpc)
+		}
+		if rpc == nil {
+			continue
+		}
 		if e = a.writeRPC(s, rpc); e != nil {
 			_ = s.Reset()
 			break
 		}
+	}
+}
+
+func (a *Actor) closeOutbound() {
+	a.outMu.Lock()
+	out := a.outbound
+	a.outbound = nil
+	a.outMu.Unlock()
+	if out != nil && out.topics != nil {
+		out.topics.Close()
 	}
 }
 

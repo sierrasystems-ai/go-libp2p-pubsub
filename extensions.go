@@ -13,6 +13,7 @@ import (
 type PeerExtensions struct {
 	TestExtension   bool
 	PartialMessages bool
+	TopicStreams    bool
 }
 
 type TestExtensionConfig struct {
@@ -44,6 +45,7 @@ func peerExtensionsFromRPC(rpc *RPC) PeerExtensions {
 	if hasPeerExtensions(rpc) {
 		out.TestExtension = rpc.Control.Extensions.GetTestExtension()
 		out.PartialMessages = rpc.Control.Extensions.GetPartialMessages()
+		out.TopicStreams = rpc.Control.Extensions.GetTopicStreams()
 	}
 	return out
 }
@@ -66,6 +68,15 @@ func (pe *PeerExtensions) ExtendRPC(rpc *RPC) *RPC {
 			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
 		}
 		rpc.Control.Extensions.PartialMessages = &pe.PartialMessages
+	}
+	if pe.TopicStreams {
+		if rpc.Control == nil {
+			rpc.Control = &pubsub_pb.ControlMessage{}
+		}
+		if rpc.Control.Extensions == nil {
+			rpc.Control.Extensions = &pubsub_pb.ControlExtensions{}
+		}
+		rpc.Control.Extensions.TopicStreams = &pe.TopicStreams
 	}
 	return rpc
 }
@@ -91,6 +102,11 @@ type extensionsState struct {
 	testExtension     *testExtension
 
 	partialMessagesExtension partialMessageInterface
+
+	// onTopicStreamsEnabled / onTopicStreamsDisabled are invoked once the Topic
+	// Streams extension is mutually negotiated (or torn down) with a peer.
+	onTopicStreamsEnabled  func(peer.ID)
+	onTopicStreamsDisabled func(peer.ID)
 }
 
 func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool)) *extensionsState {
@@ -105,6 +121,15 @@ func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer
 }
 
 func (es *extensionsState) HandleRPC(rpc *RPC) error {
+	if rpc.viaTopicStream {
+		// Topic-stream RPCs never carry the extensions control message. They
+		// must not be treated as a peer's first control RPC — a late topic RPC
+		// racing a control-stream teardown would otherwise record an all-false
+		// extensions entry and get the peer's genuine first control RPC on a replacement
+		// control stream reported as misbehavior.
+		return es.extensionsHandleRPC(rpc)
+	}
+
 	if _, ok := es.peerExtensions[rpc.from]; !ok {
 		// We know this is the first message because we didn't have extensions
 		// for this peer, and we always set extensions on the first rpc.
@@ -130,6 +155,9 @@ func (es *extensionsState) OnNewIncomingStream(peer.ID, protocol.ID) {
 }
 
 func (es *extensionsState) OnClosedIncomingStream(id peer.ID, _ protocol.ID) {
+	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsDisabled != nil {
+		es.onTopicStreamsDisabled(id)
+	}
 	delete(es.peerExtensions, id)
 	if len(es.peerExtensions) == 0 {
 		es.peerExtensions = make(map[peer.ID]PeerExtensions)
@@ -168,12 +196,46 @@ func (es *extensionsState) extensionsOnNewOutboundStream(id peer.ID) {
 	if es.myExtensions.TestExtension && es.peerExtensions[id].TestExtension {
 		es.testExtension.OnNewOutboundStream(id)
 	}
+	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsEnabled != nil {
+		es.onTopicStreamsEnabled(id)
+	}
+}
+
+// topicStreamsNegotiatedForRPC reports whether the peer and local node have
+// both advertised Topic Streams by the time rpc is processed. For a peer's
+// first RPC, use the advertisement carried by that RPC before HandleRPC stores
+// it, so an application payload cannot ride alongside the first control RPC on
+// the control stream.
+func (es *extensionsState) topicStreamsNegotiatedForRPC(rpc *RPC) bool {
+	if !es.myExtensions.TopicStreams {
+		return false
+	}
+	if _, sent := es.sentExtensions[rpc.from]; !sent {
+		return false
+	}
+	peerExtensions, known := es.peerExtensions[rpc.from]
+	if !known {
+		peerExtensions = peerExtensionsFromRPC(rpc)
+		es.peerExtensions[rpc.from] = peerExtensions
+	}
+	return peerExtensions.TopicStreams
+}
+
+func (es *extensionsState) topicStreamsNegotiated(id peer.ID) bool {
+	if !es.myExtensions.TopicStreams || !es.peerExtensions[id].TopicStreams {
+		return false
+	}
+	_, sent := es.sentExtensions[id]
+	return sent
 }
 
 // extensionsOnClosedOutboundStream is always called after extensionsOnNewOutboundStream.
 func (es *extensionsState) extensionsOnClosedOutboundStream(id peer.ID) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {
 		es.partialMessagesExtension.OnClosedOutboundStream(id)
+	}
+	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsDisabled != nil {
+		es.onTopicStreamsDisabled(id)
 	}
 }
 
@@ -195,6 +257,39 @@ func (es *extensionsState) extensionsHandleRPC(rpc *RPC) error {
 func (es *extensionsState) Heartbeat() {
 	if es.myExtensions.PartialMessages {
 		es.partialMessagesExtension.Heartbeat()
+	}
+}
+
+// TopicStreamsConfig controls inbound topic-stream admission.
+type TopicStreamsConfig struct {
+	MaxInboundStreamsPerTopic int
+	MaxInboundStreamsPerPeer  int
+}
+
+func DefaultTopicStreamsConfig() TopicStreamsConfig {
+	return TopicStreamsConfig{MaxInboundStreamsPerTopic: 3, MaxInboundStreamsPerPeer: 256}
+}
+
+// WithTopicStreams enables Topic Streams. Omitting config preserves the default limits.
+func WithTopicStreams(config ...TopicStreamsConfig) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return errors.New("pubsub router is not gossipsub")
+		}
+		cfg := DefaultTopicStreamsConfig()
+		if len(config) > 1 {
+			return errors.New("WithTopicStreams accepts at most one config")
+		}
+		if len(config) == 1 {
+			cfg = config[0]
+		}
+		if cfg.MaxInboundStreamsPerTopic <= 0 || cfg.MaxInboundStreamsPerPeer <= 0 {
+			return errors.New("topic stream limits must be positive")
+		}
+		ps.topicStreamsConfig = cfg
+		gs.extensions.myExtensions.TopicStreams = true
+		return nil
 	}
 }
 

@@ -524,6 +524,7 @@ type ControlExtensions struct {
 	// Experimental extensions must use field numbers larger than 0x200000 to be
 	// encoded with 4 bytes
 	TestExtension *bool `protobuf:"varint,6492434,opt,name=testExtension" json:"testExtension,omitempty"`
+	TopicStreams  *bool `protobuf:"varint,6492435,opt,name=topicStreams" json:"topicStreams,omitempty"` // See topic-streams.md
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -568,6 +569,13 @@ func (x *ControlExtensions) GetPartialMessages() bool {
 func (x *ControlExtensions) GetTestExtension() bool {
 	if x != nil && x.TestExtension != nil {
 		return *x.TestExtension
+	}
+	return false
+}
+
+func (x *ControlExtensions) GetTopicStreams() bool {
+	if x != nil && x.TopicStreams != nil {
+		return *x.TopicStreams
 	}
 	return false
 }
@@ -730,6 +738,224 @@ func (x *PartialMessagesExtension) GetPartsMetadata() []byte {
 	return nil
 }
 
+// TopicRPCHeader is the first length-prefixed message sent by the initiator of a
+// topic stream (see topic-streams.md). It identifies the topic the stream is
+// scoped to.
+type TopicRPCHeader struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Topic         *string                `protobuf:"bytes,1,opt,name=topic" json:"topic,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TopicRPCHeader) Reset() {
+	*x = TopicRPCHeader{}
+	mi := &file_rpc_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicRPCHeader) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicRPCHeader) ProtoMessage() {}
+
+func (x *TopicRPCHeader) ProtoReflect() protoreflect.Message {
+	mi := &file_rpc_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicRPCHeader.ProtoReflect.Descriptor instead.
+func (*TopicRPCHeader) Descriptor() ([]byte, []int) {
+	return file_rpc_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *TopicRPCHeader) GetTopic() string {
+	if x != nil && x.Topic != nil {
+		return *x.Topic
+	}
+	return ""
+}
+
+// TopicScopedMessage is identical to Message, except the topic field is unused
+// on the wire. The topic is carried once in the TopicRPCHeader instead.
+type TopicScopedMessage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	From  []byte                 `protobuf:"bytes,1,opt,name=from" json:"from,omitempty"`
+	Data  []byte                 `protobuf:"bytes,2,opt,name=data" json:"data,omitempty"`
+	Seqno []byte                 `protobuf:"bytes,3,opt,name=seqno" json:"seqno,omitempty"`
+	// Included for computing signatures, not used on the wire.
+	UnsetTopicName *string `protobuf:"bytes,4,opt,name=unset_topic_name,json=unsetTopicName" json:"unset_topic_name,omitempty"`
+	Signature      []byte  `protobuf:"bytes,5,opt,name=signature" json:"signature,omitempty"`
+	Key            []byte  `protobuf:"bytes,6,opt,name=key" json:"key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *TopicScopedMessage) Reset() {
+	*x = TopicScopedMessage{}
+	mi := &file_rpc_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicScopedMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicScopedMessage) ProtoMessage() {}
+
+func (x *TopicScopedMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_rpc_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicScopedMessage.ProtoReflect.Descriptor instead.
+func (*TopicScopedMessage) Descriptor() ([]byte, []int) {
+	return file_rpc_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *TopicScopedMessage) GetFrom() []byte {
+	if x != nil {
+		return x.From
+	}
+	return nil
+}
+
+func (x *TopicScopedMessage) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *TopicScopedMessage) GetSeqno() []byte {
+	if x != nil {
+		return x.Seqno
+	}
+	return nil
+}
+
+func (x *TopicScopedMessage) GetUnsetTopicName() string {
+	if x != nil && x.UnsetTopicName != nil {
+		return *x.UnsetTopicName
+	}
+	return ""
+}
+
+func (x *TopicScopedMessage) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+func (x *TopicScopedMessage) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+// TopicRPC is the length-prefixed message sent on a topic stream after the
+// TopicRPCHeader.
+type TopicRPC struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*TopicRPC_Publish
+	//	*TopicRPC_Partial
+	Payload       isTopicRPC_Payload `protobuf_oneof:"payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TopicRPC) Reset() {
+	*x = TopicRPC{}
+	mi := &file_rpc_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicRPC) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicRPC) ProtoMessage() {}
+
+func (x *TopicRPC) ProtoReflect() protoreflect.Message {
+	mi := &file_rpc_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicRPC.ProtoReflect.Descriptor instead.
+func (*TopicRPC) Descriptor() ([]byte, []int) {
+	return file_rpc_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *TopicRPC) GetPayload() isTopicRPC_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *TopicRPC) GetPublish() *TopicScopedMessage {
+	if x != nil {
+		if x, ok := x.Payload.(*TopicRPC_Publish); ok {
+			return x.Publish
+		}
+	}
+	return nil
+}
+
+func (x *TopicRPC) GetPartial() *PartialMessagesExtension {
+	if x != nil {
+		if x, ok := x.Payload.(*TopicRPC_Partial); ok {
+			return x.Partial
+		}
+	}
+	return nil
+}
+
+type isTopicRPC_Payload interface {
+	isTopicRPC_Payload()
+}
+
+type TopicRPC_Publish struct {
+	Publish *TopicScopedMessage `protobuf:"bytes,1,opt,name=publish,oneof"`
+}
+
+type TopicRPC_Partial struct {
+	Partial *PartialMessagesExtension `protobuf:"bytes,2,opt,name=partial,oneof"`
+}
+
+func (*TopicRPC_Publish) isTopicRPC_Payload() {}
+
+func (*TopicRPC_Partial) isTopicRPC_Payload() {}
+
 type RPC_SubOpts struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Subscribe *bool                  `protobuf:"varint,1,opt,name=subscribe" json:"subscribe,omitempty"` // subscribe or unsubcribe
@@ -747,7 +973,7 @@ type RPC_SubOpts struct {
 
 func (x *RPC_SubOpts) Reset() {
 	*x = RPC_SubOpts{}
-	mi := &file_rpc_proto_msgTypes[12]
+	mi := &file_rpc_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -759,7 +985,7 @@ func (x *RPC_SubOpts) String() string {
 func (*RPC_SubOpts) ProtoMessage() {}
 
 func (x *RPC_SubOpts) ProtoReflect() protoreflect.Message {
-	mi := &file_rpc_proto_msgTypes[12]
+	mi := &file_rpc_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -854,11 +1080,12 @@ const file_rpc_proto_rawDesc = "" +
 	"\x10ControlIDontWant\x12\x1e\n" +
 	"\n" +
 	"messageIDs\x18\x01 \x03(\tR\n" +
-	"messageIDs\"f\n" +
+	"messageIDs\"\x8d\x01\n" +
 	"\x11ControlExtensions\x12(\n" +
 	"\x0fpartialMessages\x18\n" +
 	" \x01(\bR\x0fpartialMessages\x12'\n" +
-	"\rtestExtension\x18\x92\xa2\x8c\x03 \x01(\bR\rtestExtension\"N\n" +
+	"\rtestExtension\x18\x92\xa2\x8c\x03 \x01(\bR\rtestExtension\x12%\n" +
+	"\ftopicStreams\x18\x93\xa2\x8c\x03 \x01(\bR\ftopicStreams\"N\n" +
 	"\bPeerInfo\x12\x16\n" +
 	"\x06peerID\x18\x01 \x01(\fR\x06peerID\x12*\n" +
 	"\x10signedPeerRecord\x18\x02 \x01(\fR\x10signedPeerRecord\"\x0f\n" +
@@ -867,7 +1094,20 @@ const file_rpc_proto_rawDesc = "" +
 	"\atopicID\x18\x01 \x01(\tR\atopicID\x12\x18\n" +
 	"\agroupID\x18\x02 \x01(\fR\agroupID\x12&\n" +
 	"\x0epartialMessage\x18\x03 \x01(\fR\x0epartialMessage\x12$\n" +
-	"\rpartsMetadata\x18\x04 \x01(\fR\rpartsMetadataB1Z/github.com/libp2p/go-libp2p-pubsub/pb;pubsub_pb"
+	"\rpartsMetadata\x18\x04 \x01(\fR\rpartsMetadata\"&\n" +
+	"\x0eTopicRPCHeader\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\"\xac\x01\n" +
+	"\x12TopicScopedMessage\x12\x12\n" +
+	"\x04from\x18\x01 \x01(\fR\x04from\x12\x12\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\x12\x14\n" +
+	"\x05seqno\x18\x03 \x01(\fR\x05seqno\x12(\n" +
+	"\x10unset_topic_name\x18\x04 \x01(\tR\x0eunsetTopicName\x12\x1c\n" +
+	"\tsignature\x18\x05 \x01(\fR\tsignature\x12\x10\n" +
+	"\x03key\x18\x06 \x01(\fR\x03key\"\x91\x01\n" +
+	"\bTopicRPC\x129\n" +
+	"\apublish\x18\x01 \x01(\v2\x1d.pubsub.pb.TopicScopedMessageH\x00R\apublish\x12?\n" +
+	"\apartial\x18\x02 \x01(\v2#.pubsub.pb.PartialMessagesExtensionH\x00R\apartialB\t\n" +
+	"\apayloadB1Z/github.com/libp2p/go-libp2p-pubsub/pb;pubsub_pb"
 
 var (
 	file_rpc_proto_rawDescOnce sync.Once
@@ -881,7 +1121,7 @@ func file_rpc_proto_rawDescGZIP() []byte {
 	return file_rpc_proto_rawDescData
 }
 
-var file_rpc_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_rpc_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_rpc_proto_goTypes = []any{
 	(*RPC)(nil),                      // 0: pubsub.pb.RPC
 	(*Message)(nil),                  // 1: pubsub.pb.Message
@@ -895,10 +1135,13 @@ var file_rpc_proto_goTypes = []any{
 	(*PeerInfo)(nil),                 // 9: pubsub.pb.PeerInfo
 	(*TestExtension)(nil),            // 10: pubsub.pb.TestExtension
 	(*PartialMessagesExtension)(nil), // 11: pubsub.pb.PartialMessagesExtension
-	(*RPC_SubOpts)(nil),              // 12: pubsub.pb.RPC.SubOpts
+	(*TopicRPCHeader)(nil),           // 12: pubsub.pb.TopicRPCHeader
+	(*TopicScopedMessage)(nil),       // 13: pubsub.pb.TopicScopedMessage
+	(*TopicRPC)(nil),                 // 14: pubsub.pb.TopicRPC
+	(*RPC_SubOpts)(nil),              // 15: pubsub.pb.RPC.SubOpts
 }
 var file_rpc_proto_depIdxs = []int32{
-	12, // 0: pubsub.pb.RPC.subscriptions:type_name -> pubsub.pb.RPC.SubOpts
+	15, // 0: pubsub.pb.RPC.subscriptions:type_name -> pubsub.pb.RPC.SubOpts
 	1,  // 1: pubsub.pb.RPC.publish:type_name -> pubsub.pb.Message
 	2,  // 2: pubsub.pb.RPC.control:type_name -> pubsub.pb.ControlMessage
 	11, // 3: pubsub.pb.RPC.partial:type_name -> pubsub.pb.PartialMessagesExtension
@@ -910,11 +1153,13 @@ var file_rpc_proto_depIdxs = []int32{
 	7,  // 9: pubsub.pb.ControlMessage.idontwant:type_name -> pubsub.pb.ControlIDontWant
 	8,  // 10: pubsub.pb.ControlMessage.extensions:type_name -> pubsub.pb.ControlExtensions
 	9,  // 11: pubsub.pb.ControlPrune.peers:type_name -> pubsub.pb.PeerInfo
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	13, // 12: pubsub.pb.TopicRPC.publish:type_name -> pubsub.pb.TopicScopedMessage
+	11, // 13: pubsub.pb.TopicRPC.partial:type_name -> pubsub.pb.PartialMessagesExtension
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_rpc_proto_init() }
@@ -922,13 +1167,17 @@ func file_rpc_proto_init() {
 	if File_rpc_proto != nil {
 		return
 	}
+	file_rpc_proto_msgTypes[14].OneofWrappers = []any{
+		(*TopicRPC_Publish)(nil),
+		(*TopicRPC_Partial)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rpc_proto_rawDesc), len(file_rpc_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   13,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

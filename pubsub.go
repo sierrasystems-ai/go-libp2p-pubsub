@@ -184,7 +184,13 @@ type PubSub struct {
 	activePeers map[peer.ID]*peerComm
 
 	// peerComms is the small concurrency-safe registry for per-peer communication actors.
-	peerComms *peerCommRegistry
+	peerComms          *peerCommRegistry
+	topicStreamsConfig TopicStreamsConfig
+
+	// recentlyUnsubscribed tracks topics we recently unsubscribed from, so we do
+	// not penalize peers that send us a publish before learning of the
+	// unsubscribe. Only accessed from the processLoop goroutine.
+	recentlyUnsubscribed map[string]time.Time
 
 	seenMessages    timecache.TimeCache
 	seenMsgTTL      time.Duration
@@ -314,6 +320,15 @@ type RPC struct {
 
 	// unexported on purpose, not sending this over the wire
 	from peer.ID
+	// conn identifies the connection that delivered an inbound control-stream
+	// RPC so protocol violations can close that exact connection.
+	conn network.Conn
+
+	// viaTopicStream marks RPCs reconstructed from an inbound topic stream
+	// (TopicStreamsProtocolID) rather than read off the control stream. Such
+	// RPCs never carry the extensions control message and are subject to the
+	// topic-stream scoring rules.
+	viaTopicStream bool
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -662,6 +677,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		myRelays:              make(map[string]int),
 		topics:                make(map[string]map[peer.ID]peerTopicState),
 		activePeers:           make(map[peer.ID]*peerComm),
+		topicStreamsConfig:    DefaultTopicStreamsConfig(),
+		recentlyUnsubscribed:  make(map[string]time.Time),
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
 		seenMsgTTL:            TimeCacheDuration,
@@ -700,6 +717,12 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 	ps.initPeerComms()
 
 	rt.Attach(ps)
+
+	// Inbound topic-stream acceptance depends only on local support. Mutual
+	// advertisement controls outbound routing and control-stream validation.
+	if gs, ok := rt.(*GossipSubRouter); ok && gs.extensions.myExtensions.TopicStreams {
+		h.SetStreamHandler(TopicStreamsProtocolID, ps.handleNewTopicStream)
+	}
 
 	for _, id := range rt.Protocols() {
 		if ps.protoMatchFunc != nil {
@@ -1250,8 +1273,25 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 				p.announce(sub.topic, false)
 				p.rt.Leave(sub.topic)
 			}
+			// Remember that we just unsubscribed so we don't penalize peers
+			// that send us a message before learning of the unsubscribe.
+			if p.recentlyUnsubscribed != nil {
+				p.recentlyUnsubscribed[sub.topic] = time.Now()
+			}
 		}
 	}
+}
+
+func (p *PubSub) recentlyUnsubscribedFrom(topic string) bool {
+	t, ok := p.recentlyUnsubscribed[topic]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > recentlyUnsubscribedTTL {
+		delete(p.recentlyUnsubscribed, topic)
+		return false
+	}
+	return true
 }
 
 // handleAddSubscription adds a Subscription for a particular topic. If it is
@@ -1340,6 +1380,11 @@ func (p *PubSub) handleRemoveRelay(topic string) {
 			p.disc.StopAdvertise(topic)
 			p.announce(topic, false)
 			p.rt.Leave(topic)
+			// Same grace window as handleRemoveSubscription: don't penalize
+			// peers that send us a message before learning we stopped relaying.
+			if p.recentlyUnsubscribed != nil {
+				p.recentlyUnsubscribed[topic] = time.Now()
+			}
 		}
 	}
 }
@@ -1489,6 +1534,14 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 }
 
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
+	if gs, ok := p.rt.(*GossipSubRouter); ok {
+		if !rpc.viaTopicStream && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
+			if gs.extensions.topicStreamsNegotiatedForRPC(rpc) {
+				p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
+				return
+			}
+		}
+	}
 
 	// pass the rpc through app specific validation (if any available).
 	if p.appSpecificRpcInspector != nil {
@@ -1514,6 +1567,11 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	for _, subopt := range subs {
 		t := subopt.GetTopicid()
 
+		if !subopt.GetSubscribe() {
+			if comm, ok := p.existingPeerComm(rpc.from); ok {
+				comm.RemoteUnsubscribed(t)
+			}
+		}
 		if subopt.GetSubscribe() {
 			tmap, ok := p.topics[t]
 			if !ok {
@@ -1566,6 +1624,14 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		for _, pmsg := range rpc.GetPublish() {
 			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
 				p.logger.Debug("received message in topic we didn't subscribe to; ignoring message")
+				// Penalize peers that send us topic-stream messages for topics
+				// we are not subscribed to, unless we recently unsubscribed
+				// (the peer may not have learned of the unsubscribe yet). The
+				// spec scopes this downscore to topic streams; messages on the
+				// control stream are ignored as before.
+				if rpc.viaTopicStream && !p.recentlyUnsubscribedFrom(pmsg.GetTopic()) {
+					p.peerFeedback("", rpc.from, PeerFeedbackBehaviorPenalty)
+				}
 				continue
 			}
 
@@ -1903,29 +1969,38 @@ type PeerFeedbackKind int
 const (
 	PeerFeedbackUsefulMessage PeerFeedbackKind = iota
 	PeerFeedbackInvalidMessage
+	// PeerFeedbackBehaviorPenalty applies one peer-wide behaviour penalty.
+	PeerFeedbackBehaviorPenalty
 )
 
-// PeerFeedback lets applications inform GossipSub's peer scorer about the
-// performance of a peer's message. This is useful if the application is using
-// partial messages, because the application handles merging parts.
-func (p *PubSub) PeerFeedback(topic string, peer peer.ID, kind PeerFeedbackKind) error {
-	gs, ok := p.rt.(*GossipSubRouter)
-	if !ok {
+// PeerFeedback informs GossipSub's peer scorer about a peer. Message feedback
+// is topic-scoped.
+func (p *PubSub) PeerFeedback(topic string, pid peer.ID, kind PeerFeedbackKind) error {
+	if _, ok := p.rt.(*GossipSubRouter); !ok {
 		return errors.New("peer feedback is only supported by GossipSub")
 	}
-	return p.syncEval(func() {
-		if gs.score == nil {
-			return
-		}
-		gs.score.Lock()
-		defer gs.score.Unlock()
-		switch kind {
-		case PeerFeedbackUsefulMessage:
-			gs.score.markFirstMessageDelivery(peer, topic)
-		case PeerFeedbackInvalidMessage:
-			gs.score.markInvalidMessageDelivery(peer, topic)
-		}
-	})
+	return p.syncEval(func() { p.peerFeedback(topic, pid, kind) })
+}
+
+// peerFeedback runs on the PubSub process loop. Callers outside that loop must
+// use PeerFeedback so scorer updates are serialized with router processing.
+func (p *PubSub) peerFeedback(topic string, pid peer.ID, kind PeerFeedbackKind) {
+	gs, ok := p.rt.(*GossipSubRouter)
+	if !ok || gs.score == nil {
+		return
+	}
+	if kind == PeerFeedbackBehaviorPenalty {
+		gs.score.AddPenalty(pid, 1)
+		return
+	}
+	gs.score.Lock()
+	defer gs.score.Unlock()
+	switch kind {
+	case PeerFeedbackUsefulMessage:
+		gs.score.markFirstMessageDelivery(pid, topic)
+	case PeerFeedbackInvalidMessage:
+		gs.score.markInvalidMessageDelivery(pid, topic)
+	}
 }
 
 // PublishBatch publishes a batch of messages. This only works for routers that

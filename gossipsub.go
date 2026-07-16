@@ -321,6 +321,16 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 			rt.score.AddPenalty(p, 10)
 		}
 	}, rt.sendRPC)
+	rt.extensions.onTopicStreamsEnabled = func(p peer.ID) {
+		if c, ok := rt.p.existingPeerComm(p); ok {
+			c.SetTopicStreamsEnabled(true)
+		}
+	}
+	rt.extensions.onTopicStreamsDisabled = func(p peer.ID) {
+		if c, ok := rt.p.existingPeerComm(p); ok {
+			c.SetTopicStreamsEnabled(false)
+		}
+	}
 
 	return rt
 }
@@ -667,6 +677,7 @@ func (gs *GossipSubRouter) Attach(p *PubSub) {
 	gs.p = p
 	gs.logger = p.logger
 	gs.tracer = p.tracer
+	wireTopicStreamsPeerComm(gs.extensions, p)
 
 	// start the scoring
 	gs.score.Start(gs)
@@ -2339,4 +2350,17 @@ func computeChecksum(mid string) checksum {
 		cs.length = uint8(copy(cs.payload[:], mid))
 	}
 	return cs
+}
+
+func wireTopicStreamsPeerComm(extensions *extensionsState, p *PubSub) {
+	extensions.onTopicStreamsEnabled = func(pid peer.ID) {
+		if comm, ok := p.existingPeerComm(pid); ok {
+			comm.SetTopicStreamsEnabled(true)
+		}
+	}
+	extensions.onTopicStreamsDisabled = func(pid peer.ID) {
+		if comm, ok := p.existingPeerComm(pid); ok {
+			comm.SetTopicStreamsEnabled(false)
+		}
+	}
 }

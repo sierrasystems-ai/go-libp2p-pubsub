@@ -85,6 +85,8 @@ message ControlExtensions {
   // Experimental extensions must use field numbers larger than 0x200000 to be
   // encoded with 4 bytes
   optional bool testExtension = 6492434;
+
+  optional bool topicStreams = 6492435; // See topic-streams.md
 }
 
 message PeerInfo {
@@ -103,4 +105,34 @@ message PartialMessagesExtension {
 
   // An encoded representation of the parts a peer has and wants.
   optional bytes partsMetadata = 4;
+}
+
+// TopicRPCHeader is the first length-prefixed message sent by the initiator of a
+// topic stream (see topic-streams.md). It identifies the topic the stream is
+// scoped to.
+message TopicRPCHeader {
+  optional string topic = 1;
+}
+
+// TopicScopedMessage is identical to Message, except the topic field is unused
+// on the wire. The topic is carried once in the TopicRPCHeader instead.
+message TopicScopedMessage {
+  optional bytes from = 1;
+  optional bytes data = 2;
+  optional bytes seqno = 3;
+
+  // Included for computing signatures, not used on the wire.
+  optional string unset_topic_name = 4;
+
+  optional bytes signature = 5;
+  optional bytes key = 6;
+}
+
+// TopicRPC is the length-prefixed message sent on a topic stream after the
+// TopicRPCHeader.
+message TopicRPC {
+  oneof payload {
+    TopicScopedMessage publish = 1;
+    PartialMessagesExtension partial = 2;
+  }
 }
