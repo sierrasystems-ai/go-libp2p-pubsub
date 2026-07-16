@@ -107,7 +107,7 @@ func (r *Registry) For(pid peer.ID) *Actor {
 		return a
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
-	a := &Actor{registry: r, peer: pid, events: make(chan any, mailboxSize), done: make(chan struct{}), ctx: ctx, cancel: cancel, queue: newRPCQueue(r.config.OutboundQueueSize)}
+	a := &Actor{registry: r, peer: pid, events: make(chan actorEvent, mailboxSize), done: make(chan struct{}), ctx: ctx, cancel: cancel, queue: newRPCQueue(r.config.OutboundQueueSize), outbound: newOutboundState(ctx)}
 	r.peers[pid] = a
 	go a.run()
 	return a
@@ -152,18 +152,18 @@ func (r *Registry) Stop() {
 }
 
 type Actor struct {
-	registry            *Registry
-	peer                peer.ID
-	events              chan any
-	done                chan struct{}
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	queue               *rpcQueue
-	started             atomic.Bool
-	outMu               sync.Mutex
-	outbound            *outboundSession
-	topicStreamsEnabled bool
+	registry *Registry
+	peer     peer.ID
+	events   chan actorEvent
+	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
+	queue    *rpcQueue
+	started  atomic.Bool
+	outbound *outboundState
 }
+type actorEvent interface{ actorEvent() }
+
 type inboundControlOpen struct {
 	stream network.Stream
 	reply  chan Generation
@@ -195,15 +195,24 @@ type cancelPendingInboundTopicRPC struct {
 	ack       chan struct{}
 }
 type stop struct{ done chan struct{} }
+
+func (inboundControlOpen) actorEvent()           {}
+func (inboundControlRPC) actorEvent()            {}
+func (inboundControlClose) actorEvent()          {}
+func (inboundTopicOpen) actorEvent()             {}
+func (inboundTopicRPC) actorEvent()              {}
+func (inboundTopicClose) actorEvent()            {}
+func (cancelPendingInboundTopicRPC) actorEvent() {}
+func (stop) actorEvent()                         {}
+
 type inboundTopic struct {
 	stream     network.Stream
 	topic      string
 	generation uint64
 	pending    *inboundTopicRPC
 }
-type outboundSession struct{ topics *topicstreams.OutboundStreams }
 
-func (a *Actor) submit(ev any) bool {
+func (a *Actor) submit(ev actorEvent) bool {
 	select {
 	case <-a.done:
 		return false
@@ -288,26 +297,20 @@ func (a *Actor) Terminate() {
 	a.queue.close()
 	a.cancel()
 }
-func (a *Actor) SetTopicStreamsEnabled(enabled bool) {
-	a.outMu.Lock()
-	a.topicStreamsEnabled = enabled
-	a.outMu.Unlock()
-}
+func (a *Actor) SetTopicStreamsEnabled(enabled bool) { a.outbound.setEnabled(enabled) }
 
 // TopicStreamsEnabled reports the actor's negotiated outbound routing state.
-func (a *Actor) TopicStreamsEnabled() bool {
-	a.outMu.Lock()
-	defer a.outMu.Unlock()
-	return a.topicStreamsEnabled
-}
-func (a *Actor) RemoteUnsubscribed(topic string) {
-	a.outMu.Lock()
-	out := a.outbound
-	a.outMu.Unlock()
-	if out != nil && out.topics != nil {
-		out.topics.CloseTopic(topic)
-	}
-}
+func (a *Actor) TopicStreamsEnabled() bool { return a.outbound.enabled() }
+
+// CloseTopic closes the current topic writer without changing remote authorization.
+func (a *Actor) CloseTopic(topic string) { a.outbound.closeTopic(topic) }
+
+// RemoteSubscribed updates the outbound authorization generation for topic.
+func (a *Actor) RemoteSubscribed(topic string) { a.outbound.setAuthorized(topic, true) }
+
+// RemoteUnsubscribed revokes topic authorization and closes its writer in the
+// same serialized state transition used by routing.
+func (a *Actor) RemoteUnsubscribed(topic string) { a.outbound.setAuthorized(topic, false) }
 
 func (a *Actor) Stop() bool {
 	ack := make(chan struct{})
@@ -335,6 +338,7 @@ func (a *Actor) run() {
 	defer close(a.done)
 	defer a.cancel()
 	defer a.queue.close()
+	defer a.outbound.close()
 	var control network.Stream
 	var controlSet bool
 	var controlGen, nextTopicID uint64
@@ -359,7 +363,7 @@ func (a *Actor) run() {
 		counts = make(map[string]int)
 		total = 0
 	}
-	closeOutbound := func() { a.closeOutbound() }
+	closeOutbound := func() { a.outbound.detach() }
 	retire := func() bool {
 		if controlSet || len(topics) > 0 || a.started.Load() {
 			return false
@@ -697,7 +701,7 @@ func (a *Actor) runOutbound() {
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()
 	defer func() {
-		a.closeOutbound()
+		a.outbound.detach()
 		_ = s.Close()
 	}()
 	hello, ok := h.PrepareHello(ctx, a.peer, s.Protocol())
@@ -711,9 +715,8 @@ func (a *Actor) runOutbound() {
 			return
 		}
 	}
-	a.outMu.Lock()
-	a.outbound = &outboundSession{topics: topicstreams.NewOutboundStreams(ctx, a.registry.config.Host, a.peer, a.registry.config.OutboundQueueSize, a.registry.config.Logger, a.registry.config.TopicStreamsHooks)}
-	a.outMu.Unlock()
+	topics := topicstreams.NewOutboundStreams(ctx, a.registry.config.Host, a.peer, a.registry.config.OutboundQueueSize, a.registry.config.Logger, a.registry.config.TopicStreamsHooks)
+	a.outbound.attach(topics)
 	go func() {
 		_, e := s.Read([]byte{0})
 		if e == nil {
@@ -727,13 +730,7 @@ func (a *Actor) runOutbound() {
 		if e != nil {
 			return
 		}
-		a.outMu.Lock()
-		out := a.outbound
-		enabled := a.topicStreamsEnabled
-		a.outMu.Unlock()
-		if enabled && out != nil {
-			rpc = out.topics.RouteRPC(rpc)
-		}
+		rpc = a.outbound.route(rpc).Control
 		if rpc == nil {
 			continue
 		}
@@ -741,16 +738,6 @@ func (a *Actor) runOutbound() {
 			_ = s.Reset()
 			break
 		}
-	}
-}
-
-func (a *Actor) closeOutbound() {
-	a.outMu.Lock()
-	out := a.outbound
-	a.outbound = nil
-	a.outMu.Unlock()
-	if out != nil && out.topics != nil {
-		out.topics.Close()
 	}
 }
 

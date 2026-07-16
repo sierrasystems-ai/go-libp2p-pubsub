@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestRPCQueuePriorityAndCapacity(t *testing.T) {
@@ -181,14 +182,25 @@ func (s *remoteUnsubscribeStream) Reset() error {
 	return nil
 }
 
-func TestRemoteUnsubscribedClosesOutboundTopicStream(t *testing.T) {
+func TestQueuedPayloadAfterUnsubscribeCannotRecreateWriter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stream := newRemoteUnsubscribeStream()
-	topics := topicstreams.NewOutboundStreams(ctx, remoteUnsubscribeHost{stream: stream}, peer.ID("peer"), 1, nil, topicstreams.OutboundHooks{})
-	actor := &Actor{outbound: &outboundSession{topics: topics}}
-	if !topics.Send(topicstreams.Envelope{Topic: "topic", Publish: &pb.Message{}}) {
-		t.Fatal("failed to start outbound topic stream")
+	dropped := make(chan topicstreams.Envelope, 1)
+	registry := NewRegistry(ctx, Config{
+		Host:              remoteUnsubscribeHost{stream: stream},
+		OutboundQueueSize: 1,
+		TopicStreamsHooks: topicstreams.OutboundHooks{Drop: func(_ peer.ID, e topicstreams.Envelope) { dropped <- e }},
+	}, Hooks{})
+	actor := registry.For(peer.ID("peer"))
+	topics := topicstreams.NewOutboundStreams(ctx, remoteUnsubscribeHost{stream: stream}, peer.ID("peer"), 1, nil, registry.config.TopicStreamsHooks)
+	actor.outbound.attach(topics)
+	actor.SetTopicStreamsEnabled(true)
+	actor.RemoteSubscribed("topic")
+
+	first := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic"), Data: []byte("first")}}}
+	if result := actor.outbound.route(first); result.Accepted != 1 {
+		t.Fatalf("first payload was not accepted: %#v", result)
 	}
 	select {
 	case <-stream.payloadStarted:
@@ -197,10 +209,26 @@ func TestRemoteUnsubscribedClosesOutboundTopicStream(t *testing.T) {
 	}
 
 	actor.RemoteUnsubscribed("topic")
+	queued := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic"), Data: []byte("queued")}}}
+	result := actor.outbound.route(queued)
+	if result.Accepted != 0 || result.Dropped != 1 {
+		t.Fatalf("stale queued payload disposition: %#v", result)
+	}
+	select {
+	case got := <-dropped:
+		if string(got.Publish.Data) != "queued" {
+			t.Fatalf("unexpected dropped payload %q", got.Publish.Data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale queued payload was not reported dropped")
+	}
 	close(stream.releasePayload)
 	select {
 	case <-stream.reset:
 	case <-time.After(time.Second):
-		t.Fatal("remote unsubscribe did not close outbound topic stream")
+		t.Fatal("unsubscribe did not close existing writer")
+	}
+	if got := stream.writes.Load(); got != 2 {
+		t.Fatalf("queued payload recreated writer: got %d writes, want header plus first payload", got)
 	}
 }

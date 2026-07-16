@@ -154,25 +154,49 @@ func PartialEnvelope(x *pb.PartialMessagesExtension) Envelope {
 	return Envelope{Topic: x.GetTopicID(), Partial: x}
 }
 
-// RouteRPC sends topic-scoped payloads and returns the control-stream remainder.
-// Clone once because queued envelopes outlive this call and callers may retain rpc.
-func (s *OutboundStreams) RouteRPC(rpc *pb.RPC) *pb.RPC {
+// RouteResult describes the disposition of one routed RPC. Every topic
+// payload is either accepted by a writer queue or synchronously reported as a
+// drop; Control contains the control-stream remainder.
+type RouteResult struct {
+	Control  *pb.RPC
+	Accepted int
+	Dropped  int
+}
+
+// RouteRPC sends authorized topic-scoped payloads and returns the control
+// stream remainder. authorize is evaluated before Send and may reject stale
+// subscription generations. Clone once because queued envelopes outlive this
+// call and callers may retain rpc.
+func (s *OutboundStreams) RouteRPC(rpc *pb.RPC, authorize func(Envelope) bool) RouteResult {
+	var result RouteResult
 	if rpc == nil {
-		return nil
+		return result
 	}
 	remainder := proto.CloneOf(rpc)
+	route := func(e Envelope) {
+		if authorize != nil && !authorize(e) {
+			s.drop(e)
+			result.Dropped++
+			return
+		}
+		if s.Send(e) {
+			result.Accepted++
+		} else {
+			result.Dropped++
+		}
+	}
 	for _, msg := range remainder.GetPublish() {
-		s.Send(PublishEnvelope(msg))
+		route(PublishEnvelope(msg))
 	}
 	if partial := remainder.GetPartial(); partial != nil {
-		s.Send(PartialEnvelope(partial))
+		route(PartialEnvelope(partial))
 	}
 	remainder.Publish = nil
 	remainder.Partial = nil
-	if proto.Size(remainder) == 0 {
-		return nil
+	if proto.Size(remainder) != 0 {
+		result.Control = remainder
 	}
-	return remainder
+	return result
 }
 
 func (e Envelope) wire() *pb.TopicRPC {
@@ -228,6 +252,7 @@ func (s *OutboundStreams) Send(e Envelope) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || e.Topic == "" || e.wire() == nil {
+		s.drop(e)
 		return false
 	}
 	w, ok := s.streams[e.Topic]
@@ -250,9 +275,7 @@ func (s *OutboundStreams) Send(e Envelope) bool {
 	case w.ch <- e:
 		return true
 	default:
-		if s.hooks.Drop != nil {
-			s.hooks.Drop(s.peer, e)
-		}
+		s.drop(e)
 		return false
 	}
 }
@@ -300,7 +323,8 @@ func (s *OutboundStreams) Close() {
 }
 
 func (s *OutboundStreams) run(ctx context.Context, w *writer) {
-	defer close(w.done)
+	var inFlight *Envelope
+	defer func() { s.finishWriter(w, inFlight) }()
 	if s.host == nil {
 		s.logger.Debug("topic stream host is not configured", "peer", s.peer, "topic", w.topic)
 		return
@@ -320,12 +344,8 @@ func (s *OutboundStreams) run(ctx context.Context, w *writer) {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
-		select {
-		case <-ctx.Done():
-			return
 		case e := <-w.ch:
+			inFlight = &e
 			if ctx.Err() != nil {
 				return
 			}
@@ -333,7 +353,34 @@ func (s *OutboundStreams) run(ctx context.Context, w *writer) {
 				s.logger.Debug("failed to write topic rpc", "peer", s.peer, "topic", w.topic, "err", err)
 				return
 			}
+			inFlight = nil
 		}
+	}
+}
+
+func (s *OutboundStreams) finishWriter(w *writer, inFlight *Envelope) {
+	s.mu.Lock()
+	if current := s.streams[w.topic]; current == w {
+		delete(s.streams, w.topic)
+	}
+	if inFlight != nil {
+		s.drop(*inFlight)
+	}
+	for {
+		select {
+		case e := <-w.ch:
+			s.drop(e)
+		default:
+			close(w.done)
+			s.mu.Unlock()
+			return
+		}
+	}
+}
+
+func (s *OutboundStreams) drop(e Envelope) {
+	if s.hooks.Drop != nil {
+		s.hooks.Drop(s.peer, e)
 	}
 }
 

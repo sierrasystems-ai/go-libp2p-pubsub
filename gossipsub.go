@@ -321,17 +321,6 @@ func DefaultGossipSubRouter(h host.Host) *GossipSubRouter {
 			rt.score.AddPenalty(p, 10)
 		}
 	}, rt.sendRPC)
-	rt.extensions.onTopicStreamsEnabled = func(p peer.ID) {
-		if c, ok := rt.p.existingPeerComm(p); ok {
-			c.SetTopicStreamsEnabled(true)
-		}
-	}
-	rt.extensions.onTopicStreamsDisabled = func(p peer.ID) {
-		if c, ok := rt.p.existingPeerComm(p); ok {
-			c.SetTopicStreamsEnabled(false)
-		}
-	}
-
 	return rt
 }
 

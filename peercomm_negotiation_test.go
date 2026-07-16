@@ -21,7 +21,11 @@ func TestTopicStreamsNegotiationUpdatesExistingPeerComm(t *testing.T) {
 	actor := registry.For(pid)
 	extensions.OnNewOutboundStream(pid, &RPC{})
 	remoteSupportsTopicStreams := true
-	if err := extensions.HandleRPC(&RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Extensions: &pb.ControlExtensions{TopicStreams: &remoteSupportsTopicStreams}}}, from: pid}); err != nil {
+	rpc := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Extensions: &pb.ControlExtensions{TopicStreams: &remoteSupportsTopicStreams}}}, from: pid}
+	if got := extensions.acceptInboundRPC(rpc); got != inboundRPCAccept {
+		t.Fatalf("first negotiation RPC was rejected: %v", got)
+	}
+	if err := extensions.HandleRPC(rpc); err != nil {
 		t.Fatal(err)
 	}
 	if !actor.TopicStreamsEnabled() {

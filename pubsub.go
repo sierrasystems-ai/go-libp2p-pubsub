@@ -1409,6 +1409,9 @@ func (p *PubSub) announce(topic string, sub bool) {
 
 	out := rpcWithSubs(subopt)
 	for pid, peer := range p.activePeers {
+		if !sub {
+			peer.CloseTopic(topic)
+		}
 		err := peer.Send(&out.RPC, false)
 		if err != nil {
 			p.logger.Info("Can't send announce message to peer: queue full; scheduling retry", "peer", pid)
@@ -1421,7 +1424,13 @@ func (p *PubSub) announce(topic string, sub bool) {
 }
 
 func (p *PubSub) announceRetry(pid peer.ID, topic string, sub bool) {
-	time.Sleep(time.Duration(1+rand.Intn(1000)) * time.Millisecond)
+	timer := time.NewTimer(time.Duration(1+rand.Intn(1000)) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-p.ctx.Done():
+		return
+	}
 
 	retry := func() {
 		_, okSubs := p.mySubs[topic]
@@ -1535,11 +1544,9 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	if gs, ok := p.rt.(*GossipSubRouter); ok {
-		if !rpc.viaTopicStream && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
-			if gs.extensions.topicStreamsNegotiatedForRPC(rpc) {
-				p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
-				return
-			}
+		if gs.extensions.acceptInboundRPC(rpc) == inboundRPCRejectControlPayload {
+			p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
+			return
 		}
 	}
 
@@ -1567,8 +1574,10 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	for _, subopt := range subs {
 		t := subopt.GetTopicid()
 
-		if !subopt.GetSubscribe() {
-			if comm, ok := p.existingPeerComm(rpc.from); ok {
+		if comm, ok := p.existingPeerComm(rpc.from); ok {
+			if subopt.GetSubscribe() {
+				comm.RemoteSubscribed(t)
+			} else {
 				comm.RemoteUnsubscribed(t)
 			}
 		}

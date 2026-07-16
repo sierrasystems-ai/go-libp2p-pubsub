@@ -120,34 +120,43 @@ func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer
 	}
 }
 
-func (es *extensionsState) HandleRPC(rpc *RPC) error {
+type inboundRPCDisposition uint8
+
+const (
+	inboundRPCAccept inboundRPCDisposition = iota
+	inboundRPCRejectControlPayload
+)
+
+// acceptInboundRPC is the canonical control-RPC admission operation. It first
+// derives the peer advertisement, validates payload placement against the
+// resulting negotiated state, then commits the first advertisement exactly
+// once. Topic-stream RPCs do not participate in control-stream negotiation.
+func (es *extensionsState) acceptInboundRPC(rpc *RPC) inboundRPCDisposition {
 	if rpc.viaTopicStream {
-		// Topic-stream RPCs never carry the extensions control message. They
-		// must not be treated as a peer's first control RPC — a late topic RPC
-		// racing a control-stream teardown would otherwise record an all-false
-		// extensions entry and get the peer's genuine first control RPC on a replacement
-		// control stream reported as misbehavior.
-		return es.extensionsHandleRPC(rpc)
+		return inboundRPCAccept
 	}
 
-	if _, ok := es.peerExtensions[rpc.from]; !ok {
-		// We know this is the first message because we didn't have extensions
-		// for this peer, and we always set extensions on the first rpc.
-		es.peerExtensions[rpc.from] = peerExtensionsFromRPC(rpc)
-		if _, ok := es.sentExtensions[rpc.from]; ok {
-			// We just finished both sending and receiving the extensions
-			// control message.
+	peerExtensions, known := es.peerExtensions[rpc.from]
+	if !known {
+		peerExtensions = peerExtensionsFromRPC(rpc)
+	}
+	_, sent := es.sentExtensions[rpc.from]
+	if es.myExtensions.TopicStreams && sent && peerExtensions.TopicStreams && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
+		return inboundRPCRejectControlPayload
+	}
+
+	if !known {
+		es.peerExtensions[rpc.from] = peerExtensions
+		if sent {
 			es.extensionsOnNewOutboundStream(rpc.from)
 		}
-	} else {
-		// We already have an extension for this peer. If they send us another
-		// extensions control message, that is a protocol error. We should
-		// down score them because they are misbehaving.
-		if hasPeerExtensions(rpc) {
-			es.reportMisbehavior(rpc.from)
-		}
+	} else if hasPeerExtensions(rpc) {
+		es.reportMisbehavior(rpc.from)
 	}
+	return inboundRPCAccept
+}
 
+func (es *extensionsState) HandleRPC(rpc *RPC) error {
 	return es.extensionsHandleRPC(rpc)
 }
 
@@ -199,26 +208,6 @@ func (es *extensionsState) extensionsOnNewOutboundStream(id peer.ID) {
 	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsEnabled != nil {
 		es.onTopicStreamsEnabled(id)
 	}
-}
-
-// topicStreamsNegotiatedForRPC reports whether the peer and local node have
-// both advertised Topic Streams by the time rpc is processed. For a peer's
-// first RPC, use the advertisement carried by that RPC before HandleRPC stores
-// it, so an application payload cannot ride alongside the first control RPC on
-// the control stream.
-func (es *extensionsState) topicStreamsNegotiatedForRPC(rpc *RPC) bool {
-	if !es.myExtensions.TopicStreams {
-		return false
-	}
-	if _, sent := es.sentExtensions[rpc.from]; !sent {
-		return false
-	}
-	peerExtensions, known := es.peerExtensions[rpc.from]
-	if !known {
-		peerExtensions = peerExtensionsFromRPC(rpc)
-		es.peerExtensions[rpc.from] = peerExtensions
-	}
-	return peerExtensions.TopicStreams
 }
 
 func (es *extensionsState) topicStreamsNegotiated(id peer.ID) bool {

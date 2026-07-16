@@ -33,7 +33,8 @@ func TestRouteRPCSendsTopicPayloadsAndReturnsControlRemainder(t *testing.T) {
 		Control:       &pb.ControlMessage{},
 	}
 
-	remainder := streams.RouteRPC(rpc)
+	result := streams.RouteRPC(rpc, nil)
+	remainder := result.Control
 	if remainder == nil || len(remainder.GetSubscriptions()) != 1 || remainder.GetControl() == nil {
 		t.Fatalf("unexpected control remainder: %#v", remainder)
 	}
@@ -54,7 +55,7 @@ func TestRouteRPCSendsTopicPayloadsAndReturnsControlRemainder(t *testing.T) {
 func TestRouteRPCTopicOnlyHasNoControlRemainder(t *testing.T) {
 	rpc := &pb.RPC{Publish: []*pb.Message{{}}}
 	streams := &OutboundStreams{}
-	if got := streams.RouteRPC(rpc); got != nil {
+	if got := streams.RouteRPC(rpc, nil).Control; got != nil {
 		t.Fatalf("expected nil remainder, got %#v", got)
 	}
 }
@@ -63,7 +64,7 @@ func TestRouteRPCPreservesUnknownFields(t *testing.T) {
 	rpc := &pb.RPC{}
 	rpc.ProtoReflect().SetUnknown([]byte{0xa0, 0x06, 0x01})
 	streams := &OutboundStreams{}
-	remainder := streams.RouteRPC(rpc)
+	remainder := streams.RouteRPC(rpc, nil).Control
 	if remainder == nil || string(remainder.ProtoReflect().GetUnknown()) != string(rpc.ProtoReflect().GetUnknown()) {
 		t.Fatalf("unknown fields were not preserved: %#v", remainder)
 	}
@@ -136,11 +137,92 @@ func TestWriterCancellationDoesNotDrainQueue(t *testing.T) {
 	if got := stream.writes.Load(); got != 2 {
 		t.Fatalf("cancellation drained queued payload: got %d writes, want header plus first payload", got)
 	}
-	if got := len(w.ch); got != 1 {
-		t.Fatalf("queued payload was consumed after cancellation: %d remain, want 1", got)
+	if got := len(w.ch); got != 0 {
+		t.Fatalf("queued payload was not finalized after cancellation: %d remain, want 0", got)
 	}
 }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+type failingHost struct {
+	host.Host
+	stream network.Stream
+	err    error
+}
+
+func (h failingHost) NewStream(context.Context, peer.ID, ...protocol.ID) (network.Stream, error) {
+	return h.stream, h.err
+}
+
+type failingStream struct {
+	network.Stream
+	failWrite int32
+	writes    atomic.Int32
+}
+
+func (s *failingStream) Write(p []byte) (int, error) {
+	if s.writes.Add(1) == s.failWrite {
+		return 0, io.ErrClosedPipe
+	}
+	return len(p), nil
+}
+func (s *failingStream) Read([]byte) (int, error)         { return 0, io.EOF }
+func (s *failingStream) SetWriteDeadline(time.Time) error { return nil }
+func (s *failingStream) Reset() error                     { return nil }
+
+func TestRouteRPCReportsRejectedPayload(t *testing.T) {
+	var drops atomic.Int32
+	streams := NewOutboundStreams(context.Background(), nil, peer.ID("peer"), 1, nil, OutboundHooks{
+		Drop: func(peer.ID, Envelope) { drops.Add(1) },
+	})
+	result := streams.RouteRPC(&pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic")}}}, func(Envelope) bool { return false })
+	if result.Accepted != 0 || result.Dropped != 1 || result.Control != nil {
+		t.Fatalf("unexpected route result: %#v", result)
+	}
+	if drops.Load() != 1 {
+		t.Fatalf("got %d drops, want 1", drops.Load())
+	}
+}
+
+func TestWriterFailuresDropAcceptedEnvelopesExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name      string
+		host      host.Host
+		envelopes int
+	}{
+		{name: "open", host: failingHost{err: io.ErrClosedPipe}, envelopes: 2},
+		{name: "header", host: failingHost{stream: &failingStream{failWrite: 1}}, envelopes: 2},
+		{name: "payload", host: failingHost{stream: &failingStream{failWrite: 2}}, envelopes: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dropped := make(chan Envelope, tt.envelopes)
+			streams := NewOutboundStreams(ctx, tt.host, peer.ID("peer"), tt.envelopes, nil, OutboundHooks{
+				Drop: func(_ peer.ID, e Envelope) { dropped <- e },
+			})
+			for i := 0; i < tt.envelopes; i++ {
+				if !streams.Send(Envelope{Topic: "topic", Publish: &pb.Message{Data: []byte{byte(i)}}}) {
+					t.Fatalf("envelope %d was not accepted", i)
+				}
+			}
+			seen := make(map[byte]int)
+			for i := 0; i < tt.envelopes; i++ {
+				select {
+				case e := <-dropped:
+					seen[e.Publish.Data[0]]++
+				case <-time.After(time.Second):
+					t.Fatalf("timed out after %d drops", i)
+				}
+			}
+			for i := 0; i < tt.envelopes; i++ {
+				if seen[byte(i)] != 1 {
+					t.Fatalf("envelope %d dropped %d times", i, seen[byte(i)])
+				}
+			}
+		})
+	}
 }
