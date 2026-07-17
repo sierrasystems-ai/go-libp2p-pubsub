@@ -519,6 +519,9 @@ func (a *Actor) run() {
 				ev.reply <- Generation{controlGen}
 			case inboundControlRPC:
 				if ev.generation.value != controlGen || !controlSet {
+					if ev.reserved {
+						a.delivery.release()
+					}
 					continue
 				}
 				if !a.delivery.submit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control, Session: Session{outbound.generation}}, nil, ev.reserved) {
