@@ -390,7 +390,13 @@ func createPeers(t *testing.T, topic string, n int, nonMesh bool) *testPeers {
 				}
 				handler.PublishPartial(topic, groupID, pm.publishActions)
 			},
-			OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pubsub_pb.PartialMessagesExtension) error {
+			ClonePeerState: func(state peerState) peerState {
+				state.sent = append(bitmap.Bitmap(nil), state.sent...)
+				state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
+				return state
+			},
+			OnIncomingRPC: func(from peer.ID, tx *IncomingRPCTransaction[peerState], rpc *pubsub_pb.PartialMessagesExtension) error {
+				peerStates := tx.PeerStates()
 				// Handle incoming partial message data - use testPeers to track state
 				// Get or create the partial message for this topic/group
 				if testPeers.partialMessages[currentPeer][topic] == nil {
@@ -1041,8 +1047,9 @@ func TestGossipDelivery(t *testing.T) {
 		},
 	}
 
-	gossipOnIncomingRPC := func(selfID peer.ID, selfHandler **PartialMessagesExtension[peerState]) func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pubsub_pb.PartialMessagesExtension) error {
-		return func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pubsub_pb.PartialMessagesExtension) error {
+	gossipOnIncomingRPC := func(selfID peer.ID, selfHandler **PartialMessagesExtension[peerState]) func(from peer.ID, tx *IncomingRPCTransaction[peerState], rpc *pubsub_pb.PartialMessagesExtension) error {
+		return func(from peer.ID, tx *IncomingRPCTransaction[peerState], rpc *pubsub_pb.PartialMessagesExtension) error {
+			peerStates := tx.PeerStates()
 			peerState := peerStates[from]
 
 			if partialMessages[selfID][topic] == nil {
@@ -1090,8 +1097,13 @@ func TestGossipDelivery(t *testing.T) {
 
 	// Create h1 handler
 	h1Handler = &PartialMessagesExtension[peerState]{
-		Logger:             slog.Default().With("id", "h1"),
-		OnEmitGossip:       gossipForPeer(h1ID, &h1Handler),
+		Logger:       slog.Default().With("id", "h1"),
+		OnEmitGossip: gossipForPeer(h1ID, &h1Handler),
+		ClonePeerState: func(state peerState) peerState {
+			state.sent = append(bitmap.Bitmap(nil), state.sent...)
+			state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
+			return state
+		},
 		OnIncomingRPC:      gossipOnIncomingRPC(h1ID, &h1Handler),
 		GroupTTLByHeatbeat: 5,
 	}
@@ -1099,8 +1111,13 @@ func TestGossipDelivery(t *testing.T) {
 
 	// Create h2 handler
 	h2Handler = &PartialMessagesExtension[peerState]{
-		Logger:             slog.Default().With("id", "h2"),
-		OnEmitGossip:       gossipForPeer(h2ID, &h2Handler),
+		Logger:       slog.Default().With("id", "h2"),
+		OnEmitGossip: gossipForPeer(h2ID, &h2Handler),
+		ClonePeerState: func(state peerState) peerState {
+			state.sent = append(bitmap.Bitmap(nil), state.sent...)
+			state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
+			return state
+		},
 		OnIncomingRPC:      gossipOnIncomingRPC(h2ID, &h2Handler),
 		GroupTTLByHeatbeat: 5,
 	}
@@ -1189,7 +1206,13 @@ func TestPeerInitiatedCounter(t *testing.T) {
 		Logger: slog.Default(),
 		OnEmitGossip: func(topic string, groupID []byte, gossipPeers []peer.ID, peerStates map[peer.ID]peerState) {
 		},
-		OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pubsub_pb.PartialMessagesExtension) error {
+		ClonePeerState: func(state peerState) peerState {
+			state.sent = append(bitmap.Bitmap(nil), state.sent...)
+			state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
+			return state
+		},
+		OnIncomingRPC: func(from peer.ID, tx *IncomingRPCTransaction[peerState], rpc *pubsub_pb.PartialMessagesExtension) error {
+			peerStates := tx.PeerStates()
 			if rpc.PartsMetadata != nil {
 				peerState := peerStates[from]
 				peerState.recvd = bitmap.Merge(peerState.recvd, rpc.PartsMetadata)
@@ -1317,7 +1340,13 @@ func FuzzPeerInitiatedCounter(f *testing.F) {
 			Logger: slog.Default(),
 			OnEmitGossip: func(topic string, groupID []byte, gossipPeers []peer.ID, peerStates map[peer.ID]peerState) {
 			},
-			OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pubsub_pb.PartialMessagesExtension) error {
+			ClonePeerState: func(state peerState) peerState {
+				state.sent = append(bitmap.Bitmap(nil), state.sent...)
+				state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
+				return state
+			},
+			OnIncomingRPC: func(from peer.ID, tx *IncomingRPCTransaction[peerState], rpc *pubsub_pb.PartialMessagesExtension) error {
+				peerStates := tx.PeerStates()
 				if rpc.PartsMetadata != nil {
 					peerState := peerStates[from]
 					peerState.recvd = bitmap.Merge(peerState.recvd, rpc.PartsMetadata)
@@ -1418,7 +1447,12 @@ func TestHandleRPCFailureRollsBackNewGroup(t *testing.T) {
 	handler := PartialMessagesExtension[peerState]{
 		Logger:       slog.Default(),
 		OnEmitGossip: func(string, []byte, []peer.ID, map[peer.ID]peerState) {},
-		OnIncomingRPC: func(peer.ID, map[peer.ID]peerState, *pubsub_pb.PartialMessagesExtension) error {
+		ClonePeerState: func(state peerState) peerState {
+			state.sent = append(bitmap.Bitmap(nil), state.sent...)
+			state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
+			return state
+		},
+		OnIncomingRPC: func(peer.ID, *IncomingRPCTransaction[peerState], *pubsub_pb.PartialMessagesExtension) error {
 			calls++
 			return errors.New("invalid partial")
 		},
@@ -1440,5 +1474,64 @@ func TestHandleRPCFailureRollsBackNewGroup(t *testing.T) {
 	ctr := handler.peerInitiatedGroupCounter[topic]
 	if ctr == nil || ctr.total != 0 || len(ctr.perPeer) != 0 {
 		t.Fatalf("failed partial consumed group quota: %#v", ctr)
+	}
+}
+
+type referencedPeerState struct {
+	values []string
+}
+
+func TestHandleRPCTransactionRejectsExistingGroupMutation(t *testing.T) {
+	topic, group := "topic", []byte("group")
+	from := peer.ID("peer")
+	deferred := 0
+	reject := false
+	handler := PartialMessagesExtension[*referencedPeerState]{
+		Logger:       slog.Default(),
+		OnEmitGossip: func(string, []byte, []peer.ID, map[peer.ID]*referencedPeerState) {},
+		ClonePeerState: func(state *referencedPeerState) *referencedPeerState {
+			if state == nil {
+				return nil
+			}
+			return &referencedPeerState{values: append([]string(nil), state.values...)}
+		},
+		OnIncomingRPC: func(from peer.ID, tx *IncomingRPCTransaction[*referencedPeerState], _ *pubsub_pb.PartialMessagesExtension) error {
+			state := tx.PeerStates()[from]
+			if state == nil {
+				state = &referencedPeerState{}
+				tx.PeerStates()[from] = state
+			}
+			state.values = append(state.values, "callback")
+			tx.Defer(func() { deferred++ })
+			if reject {
+				return errors.New("reject")
+			}
+			return nil
+		},
+	}
+	if err := handler.Init(nil); err != nil {
+		t.Fatal(err)
+	}
+	rpc := &pubsub_pb.PartialMessagesExtension{TopicID: &topic, GroupID: group}
+	if err := handler.HandleRPC(from, rpc); err != nil {
+		t.Fatal(err)
+	}
+	canonical := handler.statePerTopicPerGroup[topic][string(group)].peerState[from]
+	if deferred != 1 || !reflect.DeepEqual(canonical.values, []string{"callback"}) {
+		t.Fatalf("initial commit: deferred=%d state=%v", deferred, canonical.values)
+	}
+
+	reject = true
+	if err := handler.HandleRPC(from, rpc); err == nil {
+		t.Fatal("expected rejection")
+	}
+	if deferred != 1 {
+		t.Fatalf("rejected transaction ran deferred effect: %d", deferred)
+	}
+	if !reflect.DeepEqual(canonical.values, []string{"callback"}) {
+		t.Fatalf("rejected transaction mutated reference-valued canonical state: %v", canonical.values)
+	}
+	if got := handler.statePerTopicPerGroup[topic][string(group)].peerState[from]; got != canonical {
+		t.Fatal("rejected transaction replaced canonical state")
 	}
 }
