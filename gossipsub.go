@@ -911,6 +911,10 @@ func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 	}
 }
 
+func (gs *GossipSubRouter) handleInboundPartial(rpc *RPC, candidate inboundExtensionCandidate) error {
+	return gs.extensions.handleInboundPartial(rpc, candidate.extensions.PartialMessages)
+}
+
 func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
 	err := gs.extensions.HandleRPC(rpc)
 	if err != nil {

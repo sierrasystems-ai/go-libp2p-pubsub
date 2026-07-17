@@ -263,14 +263,17 @@ func (es *extensionsState) extensionsHandleRPC(rpc *RPC) error {
 		es.testExtension.HandleRPC(rpc.from, rpc.TestExtension)
 	}
 
-	if es.myExtensions.PartialMessages && es.peerExtensions[rpc.from].PartialMessages && rpc.Partial != nil {
-		err := es.partialMessagesExtension.HandleRPC(rpc.from, rpc.Partial)
-		if err != nil {
-			return err
-		}
-	}
+	return es.handleInboundPartial(rpc, false)
+}
 
-	return nil
+// handleInboundPartial processes only the payload-bearing Partial field. The
+// caller invokes it once, before committing the RPC's control-plane fields, and
+// removes Partial from the view subsequently passed to the router.
+func (es *extensionsState) handleInboundPartial(rpc *RPC, candidateSupportsPartial bool) error {
+	if !es.myExtensions.PartialMessages || (!candidateSupportsPartial && !es.peerExtensions[rpc.from].PartialMessages) || rpc.Partial == nil {
+		return nil
+	}
+	return es.partialMessagesExtension.HandleRPC(rpc.from, rpc.Partial)
 }
 
 func (es *extensionsState) Heartbeat() {

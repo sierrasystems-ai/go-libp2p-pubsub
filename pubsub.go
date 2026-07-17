@@ -1597,6 +1597,24 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		return
 	}
 
+	// Partial is application payload. Process it at most once and before any
+	// canonical control-plane mutations. Errors are field-local: the invalid
+	// Partial is dropped while subscriptions, negotiation, and router control
+	// continue to commit.
+	routerRPC := rpc
+	if acceptStatus == AcceptAll {
+		if handler, ok := p.rt.(interface {
+			handleInboundPartial(*RPC, inboundExtensionCandidate) error
+		}); ok && rpc.Partial != nil {
+			if err := handler.handleInboundPartial(rpc, extensionCandidate); err != nil {
+				p.logger.Warn("dropping invalid partial message", "from", rpc.from, "err", err)
+			}
+			routerRPC = rpc.withoutPayload(false, true)
+		}
+	} else {
+		routerRPC = rpc.withoutPayload(true, true)
+	}
+
 	for _, subopt := range subs {
 		t := subopt.GetTopicid()
 
@@ -1682,7 +1700,30 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		}
 	}
 
-	p.rt.HandleRPC(rpc)
+	p.rt.HandleRPC(routerRPC)
+}
+
+// withoutPayload returns an RPC view with selected application payload fields
+// removed while preserving subscriptions, control, unknown protobuf fields,
+// and delivery metadata.
+func (rpc *RPC) withoutPayload(publish, partial bool) *RPC {
+	if (!publish || len(rpc.Publish) == 0) && (!partial || rpc.Partial == nil) {
+		return rpc
+	}
+	view := &RPC{
+		RPC:            *proto.CloneOf(&rpc.RPC),
+		from:           rpc.from,
+		conn:           rpc.conn,
+		viaTopicStream: rpc.viaTopicStream,
+		session:        rpc.session,
+	}
+	if publish {
+		view.Publish = nil
+	}
+	if partial {
+		view.Partial = nil
+	}
+	return view
 }
 
 // DefaultMsgIdFn returns a unique ID of the passed Message

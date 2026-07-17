@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"runtime"
@@ -182,12 +183,22 @@ func TestPubSubRemovesBlacklistedPeer(t *testing.T) {
 
 type admissionRouter struct {
 	FloodSubRouter
-	status  AcceptStatus
-	handled int
+	status       AcceptStatus
+	handled      int
+	handledRPC   *RPC
+	partialCalls int
+	partialErr   error
 }
 
 func (r *admissionRouter) AcceptFrom(peer.ID) AcceptStatus { return r.status }
-func (r *admissionRouter) HandleRPC(*RPC)                  { r.handled++ }
+func (r *admissionRouter) HandleRPC(rpc *RPC) {
+	r.handled++
+	r.handledRPC = rpc
+}
+func (r *admissionRouter) handleInboundPartial(*RPC, inboundExtensionCandidate) error {
+	r.partialCalls++
+	return r.partialErr
+}
 
 func TestAdmissionControlsSubscriptionCommit(t *testing.T) {
 	for _, tc := range []struct {
@@ -213,6 +224,48 @@ func TestAdmissionControlsSubscriptionCommit(t *testing.T) {
 			}
 			if router.handled != tc.wantHandled {
 				t.Fatalf("HandleRPC calls=%d, want %d", router.handled, tc.wantHandled)
+			}
+		})
+	}
+}
+
+func TestAdmissionTreatsPartialAsFieldLocalPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		status           AcceptStatus
+		wantPartialCalls int
+	}{
+		{name: "control", status: AcceptControl},
+		{name: "all", status: AcceptAll, wantPartialCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pid := peer.ID("peer")
+			topic, subscribe := "topic", true
+			router := &admissionRouter{status: tc.status, partialErr: errors.New("invalid partial")}
+			ps := &PubSub{rt: router, topics: make(map[string]map[peer.ID]peerTopicState), logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			rpc := &RPC{RPC: pb.RPC{
+				Publish:       []*pb.Message{{Topic: &topic}},
+				Partial:       &pb.PartialMessagesExtension{TopicID: &topic},
+				Subscriptions: []*pb.RPC_SubOpts{{Topicid: &topic, Subscribe: &subscribe}},
+				Control:       &pb.ControlMessage{},
+			}, from: pid}
+			rpc.RPC.ProtoReflect().SetUnknown([]byte{0xa0, 0x06, 0x01})
+			ps.handleIncomingRPC(rpc)
+
+			if router.partialCalls != tc.wantPartialCalls {
+				t.Fatalf("partial calls=%d, want %d", router.partialCalls, tc.wantPartialCalls)
+			}
+			if router.handledRPC == nil || router.handledRPC.Partial != nil {
+				t.Fatalf("router received partial payload: %#v", router.handledRPC)
+			}
+			if tc.status == AcceptControl && len(router.handledRPC.Publish) != 0 {
+				t.Fatal("AcceptControl router view retained publish payload")
+			}
+			if router.handledRPC.Control == nil || len(router.handledRPC.Subscriptions) != 1 || len(router.handledRPC.RPC.ProtoReflect().GetUnknown()) == 0 {
+				t.Fatalf("control-plane fields were not preserved: %#v", router.handledRPC)
+			}
+			if _, ok := ps.topics[topic][pid]; !ok {
+				t.Fatal("field-local partial failure suppressed subscription commit")
 			}
 		})
 	}
