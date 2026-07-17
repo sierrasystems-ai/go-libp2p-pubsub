@@ -111,6 +111,7 @@ func (r *Registry) For(pid peer.ID) *Actor {
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
 	a := &Actor{registry: r, peer: pid, events: make(chan actorEvent, mailboxSize), done: make(chan struct{}), ctx: ctx, cancel: cancel, queue: newRPCQueue(r.config.OutboundQueueSize)}
+	a.delivery = newInboundDelivery(ctx, pid, r.hooks.EmitInbound, cancel)
 	r.peers[pid] = a
 	go a.run()
 	return a
@@ -169,6 +170,10 @@ type Actor struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	queue    *rpcQueue
+	delivery *inboundDelivery
+	submitMu sync.Mutex
+	pending  int
+	retiring bool
 }
 type actorEvent interface{ actorEvent() }
 
@@ -225,13 +230,14 @@ type inboundTopic struct {
 }
 
 func (a *Actor) submit(ev actorEvent) bool {
-	select {
-	case <-a.done:
+	a.submitMu.Lock()
+	defer a.submitMu.Unlock()
+	if a.retiring {
 		return false
-	default:
 	}
 	select {
 	case a.events <- ev:
+		a.pending++
 		return true
 	case <-a.done:
 		return false
@@ -305,6 +311,9 @@ func (a *Actor) DeliverInboundTopic(ad Admission, r *pb.RPC) bool {
 }
 func (a *Actor) CloseInboundTopic(ad Admission) { a.submit(inboundTopicClose{ad}) }
 func (a *Actor) Terminate() {
+	a.submitMu.Lock()
+	a.retiring = true
+	a.submitMu.Unlock()
 	a.registry.remove(a.peer, a)
 	a.queue.close()
 	a.cancel()
@@ -344,12 +353,8 @@ func (a *Actor) Stop() bool {
 	ack := make(chan struct{})
 	t := time.NewTimer(stopTimeout)
 	defer t.Stop()
-	select {
-	case a.events <- stop{ack}:
-	case <-a.done:
+	if !a.submit(stop{ack}) {
 		return true
-	case <-t.C:
-		return false
 	}
 	select {
 	case <-ack:
@@ -377,11 +382,8 @@ func (a *Actor) run() {
 	total := 0
 	outboundActive := false
 	retirementPending := false
-	emit := func(ev InboundEvent) bool {
-		if a.registry.hooks.EmitInbound == nil {
-			return true
-		}
-		return a.registry.hooks.EmitInbound(a.peer, ev)
+	emit := func(ev InboundEvent, reply chan bool) bool {
+		return a.delivery.submit(ev, reply)
 	}
 	closeTopics := func() {
 		for _, t := range topics {
@@ -399,7 +401,7 @@ func (a *Actor) run() {
 		if controlSet || len(topics) > 0 || outboundActive {
 			return false
 		}
-		return a.registry.remove(a.peer, a)
+		return a.registry.beginRetirement(a)
 	}
 	shutdown := func() {
 		if controlSet {
@@ -411,6 +413,7 @@ func (a *Actor) run() {
 	for {
 		select {
 		case raw := <-a.events:
+			a.consumed()
 			switch ev := raw.(type) {
 			case startOutbound:
 				if outboundActive {
@@ -441,7 +444,10 @@ func (a *Actor) run() {
 				close(ev.done)
 			case outboundLifecycleEnded:
 				outboundActive = false
-				retirementPending = true
+				// Cross the registry/submission barrier before invoking external
+				// lifecycle code. A callback reconnect therefore gets a fresh actor.
+				retired := retire()
+				retirementPending = !retired
 				h := a.registry.hooks
 				if ev.opened {
 					if h.OutboundDead != nil {
@@ -449,6 +455,9 @@ func (a *Actor) run() {
 					}
 				} else if h.OutboundOpenFailed != nil {
 					h.OutboundOpenFailed(a.peer)
+				}
+				if retired {
+					return
 				}
 			case setOutboundEnabled:
 				if ev.generation != outbound.generation {
@@ -484,7 +493,7 @@ func (a *Actor) run() {
 				if controlSet && control != ev.stream {
 					control.Reset()
 					closeTopics()
-					emit(InboundEvent{Kind: InboundControlClosed, Stream: control, Session: Session{outbound.generation}})
+					emit(InboundEvent{Kind: InboundControlClosed, Stream: control, Session: Session{outbound.generation}}, nil)
 				}
 				controlGen++
 				control = ev.stream
@@ -495,13 +504,13 @@ func (a *Actor) run() {
 						t.generation = controlGen
 					}
 				}
-				emit(InboundEvent{Kind: InboundControlOpened, Stream: ev.stream, Session: Session{outbound.generation}})
+				emit(InboundEvent{Kind: InboundControlOpened, Stream: ev.stream, Session: Session{outbound.generation}}, nil)
 				ev.reply <- Generation{controlGen}
 			case inboundControlRPC:
 				if ev.generation.value != controlGen || !controlSet {
 					continue
 				}
-				if !emit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control, Session: Session{outbound.generation}}) {
+				if !emit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control, Session: Session{outbound.generation}}, nil) {
 					shutdown()
 					return
 				}
@@ -511,9 +520,11 @@ func (a *Actor) run() {
 						if t.generation == controlGen && t.pending != nil {
 							ok := false
 							if time.Now().Before(t.pending.deadline) {
-								ok = emit(InboundEvent{Kind: InboundTopicRPC, RPC: t.pending.rpc, Stream: t.stream, Session: Session{outbound.generation}})
+								ok = emit(InboundEvent{Kind: InboundTopicRPC, RPC: t.pending.rpc, Stream: t.stream, Session: Session{outbound.generation}}, t.pending.reply)
 							}
-							t.pending.reply <- ok
+							if !ok {
+								t.pending.reply <- false
+							}
 							t.pending = nil
 						}
 					}
@@ -523,7 +534,7 @@ func (a *Actor) run() {
 					continue
 				}
 				closeTopics()
-				emit(InboundEvent{Kind: InboundControlClosed, Stream: ev.stream, Session: Session{outbound.generation}})
+				emit(InboundEvent{Kind: InboundControlClosed, Stream: ev.stream, Session: Session{outbound.generation}}, nil)
 				controlSet = false
 				firstControl = false
 				if retire() {
@@ -576,7 +587,9 @@ func (a *Actor) run() {
 					continue
 				}
 				if time.Now().Before(ev.deadline) {
-					ev.reply <- emit(InboundEvent{Kind: InboundTopicRPC, RPC: ev.rpc, Stream: t.stream, Session: Session{outbound.generation}})
+					if !emit(InboundEvent{Kind: InboundTopicRPC, RPC: ev.rpc, Stream: t.stream, Session: Session{outbound.generation}}, ev.reply) {
+						ev.reply <- false
+					}
 				} else {
 					ev.reply <- false
 				}
@@ -605,9 +618,9 @@ func (a *Actor) run() {
 				close(ev.done)
 				return
 			}
-			// A terminal callback may enqueue Start reentrantly. Defer retirement
-			// until those already-submitted events have been observed by the actor.
-			if retirementPending && len(a.events) == 0 && retire() {
+			// Retirement crosses the explicit submission barrier only after every
+			// event accepted in the current epoch has been consumed.
+			if retirementPending && retire() {
 				return
 			}
 		case <-a.ctx.Done():

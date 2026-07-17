@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,31 +55,29 @@ func TestRPCQueueCloseRejectsSend(t *testing.T) {
 	}
 }
 
-func TestOutboundTerminalCallbackCanRestart(t *testing.T) {
+func TestOutboundTerminalCallbackReconnectsFreshActor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var callbacks atomic.Int32
-	var actor *Actor
-	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{
+	pid := peer.ID("restart-peer")
+	callbackActor := make(chan *Actor, 1)
+	var registry *Registry
+	registry = NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{
 		OutboundOpenFailed: func(peer.ID) {
-			if callbacks.Add(1) == 1 {
-				actor.Start(time.Hour)
-			}
+			callbackActor <- registry.For(pid)
 		},
 	})
-	actor = registry.For(peer.ID("restart-peer"))
-	actor.Start(0)
-	deadline := time.After(time.Second)
-	for callbacks.Load() != 1 {
-		select {
-		case <-deadline:
-			t.Fatalf("expected one terminal callback, got %d", callbacks.Load())
-		default:
-			runtime.Gosched()
+	old := registry.For(pid)
+	old.Start(0)
+	select {
+	case fresh := <-callbackActor:
+		if fresh == nil || fresh == old {
+			t.Fatal("callback reconnect did not get a fresh actor")
 		}
-	}
-	if _, ok := registry.Existing(actor.peer); !ok {
-		t.Fatal("callback restart did not retain actor")
+		if err := old.Send(&pb.RPC{}, false); !errors.Is(err, ErrQueueClosed) {
+			t.Fatalf("stale actor accepted send: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal callback did not run")
 	}
 }
 
@@ -444,5 +441,77 @@ func TestOutboundTerminationRetiresActorAndQueue(t *testing.T) {
 	fresh := registry.For(pid)
 	if fresh == old {
 		t.Fatal("registry reused stale actor")
+	}
+}
+
+func TestBlockedEmitInboundDoesNotBlockRouteOrShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	blocked := make(chan struct{})
+	entered := make(chan struct{})
+	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{
+		EmitInbound: func(peer.ID, InboundEvent) bool {
+			close(entered)
+			<-blocked
+			return true
+		},
+	})
+	actor := registry.For(peer.ID("blocked-delivery"))
+	inbound, ok := actor.OpenInboundControl(newRemoteUnsubscribeStream())
+	if !ok {
+		t.Fatal("open inbound control")
+	}
+	actor.DeliverInboundControl(inbound, &pb.RPC{})
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("delivery callback was not entered")
+	}
+
+	generation, ok := actor.beginOutboundSession()
+	if !ok {
+		t.Fatal("route session was blocked by delivery")
+	}
+	routed := make(chan routeReply, 1)
+	go func() { routed <- actor.routeOutbound(ctx, generation, &pb.RPC{}) }()
+	select {
+	case result := <-routed:
+		if result.disposition != routeCompleted {
+			t.Fatalf("route disposition=%v", result.disposition)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route hung behind blocked delivery")
+	}
+
+	cancel()
+	select {
+	case <-actor.Done():
+	case <-time.After(time.Second):
+		t.Fatal("actor shutdown hung behind blocked delivery")
+	}
+	registry.Stop()
+}
+
+func TestRetirementBarrierSettlesAcceptedStart(t *testing.T) {
+	for range 100 {
+		ctx, cancel := context.WithCancel(context.Background())
+		registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{})
+		pid := peer.ID("retirement-race")
+		actor := registry.For(pid)
+		actor.Start(0)
+		actor.Start(time.Hour)
+		select {
+		case <-actor.Done():
+		case <-time.After(time.Second):
+			t.Fatal("accepted start was abandoned during retirement")
+		}
+		if err := actor.Send(&pb.RPC{}, false); !errors.Is(err, ErrQueueClosed) {
+			t.Fatalf("stale actor accepted send: %v", err)
+		}
+		fresh := registry.For(pid)
+		if fresh == actor {
+			t.Fatal("registry returned retiring actor")
+		}
+		cancel()
+		registry.Stop()
 	}
 }
