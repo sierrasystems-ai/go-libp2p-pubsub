@@ -250,8 +250,8 @@ func NewOutboundStreams(ctx context.Context, h host.Host, p peer.ID, queueSize i
 
 func (s *OutboundStreams) Send(e Envelope) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed || e.Topic == "" || e.wire() == nil {
+		s.mu.Unlock()
 		s.drop(e)
 		return false
 	}
@@ -273,8 +273,10 @@ func (s *OutboundStreams) Send(e Envelope) bool {
 	}
 	select {
 	case w.ch <- e:
+		s.mu.Unlock()
 		return true
 	default:
+		s.mu.Unlock()
 		s.drop(e)
 		return false
 	}
@@ -363,16 +365,22 @@ func (s *OutboundStreams) finishWriter(w *writer, inFlight *Envelope) {
 	if current := s.streams[w.topic]; current == w {
 		delete(s.streams, w.topic)
 	}
+	dropped := make([]Envelope, 0, len(w.ch)+1)
 	if inFlight != nil {
-		s.drop(*inFlight)
+		dropped = append(dropped, *inFlight)
 	}
 	for {
 		select {
 		case e := <-w.ch:
-			s.drop(e)
+			dropped = append(dropped, e)
 		default:
-			close(w.done)
+			// done closes after every accepted envelope has a final disposition,
+			// but callbacks run unlocked so they may safely reenter this object.
 			s.mu.Unlock()
+			for _, e := range dropped {
+				s.drop(e)
+			}
+			close(w.done)
 			return
 		}
 	}

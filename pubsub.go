@@ -1543,8 +1543,11 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 }
 
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
+	var extensionCandidate inboundExtensionCandidate
 	if gs, ok := p.rt.(*GossipSubRouter); ok {
-		if gs.extensions.acceptInboundRPC(rpc) == inboundRPCRejectControlPayload {
+		var disposition inboundRPCDisposition
+		extensionCandidate, disposition = gs.extensions.validateInboundRPC(rpc)
+		if disposition == inboundRPCRejectControlPayload {
 			p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
 			return
 		}
@@ -1616,12 +1619,19 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		}
 	}
 
-	// ask the router to vet the peer before commiting any processing resources
-	switch p.rt.AcceptFrom(rpc.from) {
-	case AcceptNone:
+	// Extension negotiation commits only after inspection, subscription
+	// filtering, and router admission. Subscription bookkeeping intentionally
+	// remains before AcceptFrom because router gates consume that state.
+	acceptStatus := p.rt.AcceptFrom(rpc.from)
+	if acceptStatus == AcceptNone {
 		p.logger.Debug("received RPC from router graylisted peer; dropping RPC", "peer", rpc.from)
 		return
+	}
+	if gs, ok := p.rt.(*GossipSubRouter); ok {
+		gs.extensions.commitInboundRPC(extensionCandidate)
+	}
 
+	switch acceptStatus {
 	case AcceptControl:
 		if len(rpc.GetPublish()) > 0 {
 			p.logger.Debug("peer was throttled by router; ignoring payload messages", "peer", rpc.from, "messageCount", len(rpc.GetPublish()))

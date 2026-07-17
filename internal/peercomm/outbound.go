@@ -7,148 +7,144 @@ import (
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 )
 
-type topicAuthorization struct {
-	generation uint64
-	authorized bool
+// outboundSession is owned exclusively by Actor.run. Its generation binds
+// negotiation, remote subscriptions, routing, topic writers, and teardown to
+// one outbound control-stream lifetime. A new generation always starts empty;
+// traffic queued across a transition stays on the control stream until the new
+// session negotiates and authorizes it explicitly.
+type outboundSession struct {
+	generation     uint64
+	enabled        bool
+	authorizations map[string]struct{}
+	streams        *topicstreams.OutboundStreams
 }
 
-type outboundCommand interface{ outboundCommand() }
+func (s *outboundSession) retire() {
+	if s.streams != nil {
+		s.streams.Close()
+	}
+	s.enabled = false
+	s.authorizations = nil
+	s.streams = nil
+}
 
-type setOutboundEnabled struct{ enabled bool }
+func (s *outboundSession) route(rpc *pb.RPC) topicstreams.RouteResult {
+	if !s.enabled || s.streams == nil {
+		return topicstreams.RouteResult{Control: rpc}
+	}
+	return s.streams.RouteRPC(rpc, func(envelope topicstreams.Envelope) bool {
+		_, ok := s.authorizations[envelope.Topic]
+		return ok
+	})
+}
+
+type beginOutboundSession struct{ reply chan uint64 }
+type attachOutboundStreams struct {
+	generation uint64
+	streams    *topicstreams.OutboundStreams
+	reply      chan bool
+}
+type endOutboundSession struct {
+	generation uint64
+	done       chan struct{}
+}
+type setOutboundEnabled struct {
+	enabled bool
+	done    chan struct{}
+}
 type setTopicAuthorization struct {
 	topic      string
 	authorized bool
+	done       chan struct{}
 }
-type attachOutboundStreams struct{ streams *topicstreams.OutboundStreams }
-type detachOutboundStreams struct{}
-type closeOutboundTopic struct{ topic string }
+type closeOutboundTopic struct {
+	topic string
+	done  chan struct{}
+}
 type routeOutboundRPC struct {
-	rpc   *pb.RPC
-	reply chan topicstreams.RouteResult
+	generation uint64
+	rpc        *pb.RPC
+	reply      chan topicstreams.RouteResult
 }
 type queryOutboundEnabled struct{ reply chan bool }
-type closeOutboundState struct{ done chan struct{} }
 
-func (setOutboundEnabled) outboundCommand()    {}
-func (setTopicAuthorization) outboundCommand() {}
-func (attachOutboundStreams) outboundCommand() {}
-func (detachOutboundStreams) outboundCommand() {}
-func (closeOutboundTopic) outboundCommand()    {}
-func (routeOutboundRPC) outboundCommand()      {}
-func (queryOutboundEnabled) outboundCommand()  {}
-func (closeOutboundState) outboundCommand()    {}
-
-type outboundState struct {
-	ctx      context.Context
-	commands chan outboundCommand
-	done     chan struct{}
+type outboundActorEvent interface {
+	actorEvent
+	outboundActorEvent()
 }
 
-func newOutboundState(ctx context.Context) *outboundState {
-	s := &outboundState{ctx: ctx, commands: make(chan outboundCommand), done: make(chan struct{})}
-	go s.run()
-	return s
-}
+func (beginOutboundSession) actorEvent()          {}
+func (attachOutboundStreams) actorEvent()         {}
+func (endOutboundSession) actorEvent()            {}
+func (setOutboundEnabled) actorEvent()            {}
+func (setTopicAuthorization) actorEvent()         {}
+func (closeOutboundTopic) actorEvent()            {}
+func (routeOutboundRPC) actorEvent()              {}
+func (queryOutboundEnabled) actorEvent()          {}
+func (beginOutboundSession) outboundActorEvent()  {}
+func (attachOutboundStreams) outboundActorEvent() {}
+func (endOutboundSession) outboundActorEvent()    {}
+func (setOutboundEnabled) outboundActorEvent()    {}
+func (setTopicAuthorization) outboundActorEvent() {}
+func (closeOutboundTopic) outboundActorEvent()    {}
+func (routeOutboundRPC) outboundActorEvent()      {}
+func (queryOutboundEnabled) outboundActorEvent()  {}
 
-func (s *outboundState) run() {
-	defer close(s.done)
-	var streams *topicstreams.OutboundStreams
-	var enabled bool
-	authorizations := make(map[string]topicAuthorization)
-	closeStreams := func() {
-		if streams != nil {
-			streams.Close()
-			streams = nil
-		}
+func (a *Actor) beginOutboundSession() (uint64, bool) {
+	reply := make(chan uint64, 1)
+	if !a.submit(beginOutboundSession{reply: reply}) {
+		return 0, false
 	}
-	for {
-		select {
-		case raw := <-s.commands:
-			switch command := raw.(type) {
-			case setOutboundEnabled:
-				enabled = command.enabled
-				if !enabled {
-					closeStreams()
-				}
-			case setTopicAuthorization:
-				state := authorizations[command.topic]
-				state.generation++
-				state.authorized = command.authorized
-				authorizations[command.topic] = state
-				if !command.authorized && streams != nil {
-					streams.CloseTopic(command.topic)
-				}
-			case attachOutboundStreams:
-				closeStreams()
-				streams = command.streams
-			case detachOutboundStreams:
-				closeStreams()
-			case closeOutboundTopic:
-				if streams != nil {
-					streams.CloseTopic(command.topic)
-				}
-			case routeOutboundRPC:
-				if !enabled || streams == nil {
-					command.reply <- topicstreams.RouteResult{Control: command.rpc}
-					continue
-				}
-				command.reply <- streams.RouteRPC(command.rpc, func(envelope topicstreams.Envelope) bool {
-					state := authorizations[envelope.Topic]
-					return state.authorized && state.generation != 0
-				})
-			case queryOutboundEnabled:
-				command.reply <- enabled
-			case closeOutboundState:
-				closeStreams()
-				close(command.done)
-				return
-			}
-		case <-s.ctx.Done():
-			closeStreams()
-			return
-		}
-	}
-}
-
-func (s *outboundState) send(command outboundCommand) bool {
 	select {
-	case s.commands <- command:
-		return true
-	case <-s.done:
+	case generation := <-reply:
+		return generation, true
+	case <-a.done:
+		return 0, false
+	case <-a.ctx.Done():
+		return 0, false
+	}
+}
+
+func (a *Actor) attachOutbound(generation uint64, streams *topicstreams.OutboundStreams) bool {
+	reply := make(chan bool, 1)
+	if !a.submit(attachOutboundStreams{generation: generation, streams: streams, reply: reply}) {
+		streams.Close()
 		return false
-	case <-s.ctx.Done():
+	}
+	select {
+	case attached := <-reply:
+		return attached
+	case <-a.done:
+		streams.Close()
+		return false
+	case <-a.ctx.Done():
+		streams.Close()
 		return false
 	}
 }
 
-func (s *outboundState) setEnabled(enabled bool) { s.send(setOutboundEnabled{enabled}) }
-func (s *outboundState) setAuthorized(topic string, authorized bool) {
-	s.send(setTopicAuthorization{topic: topic, authorized: authorized})
-}
-func (s *outboundState) attach(streams *topicstreams.OutboundStreams) {
-	if !s.send(attachOutboundStreams{streams}) {
-		streams.Close()
+func (a *Actor) endOutbound(generation uint64) {
+	done := make(chan struct{})
+	if a.submit(endOutboundSession{generation: generation, done: done}) {
+		select {
+		case <-done:
+		case <-a.done:
+		case <-a.ctx.Done():
+		}
 	}
 }
-func (s *outboundState) detach()                 { s.send(detachOutboundStreams{}) }
-func (s *outboundState) closeTopic(topic string) { s.send(closeOutboundTopic{topic: topic}) }
-func (s *outboundState) route(rpc *pb.RPC) topicstreams.RouteResult {
+
+func (a *Actor) routeOutbound(ctx context.Context, generation uint64, rpc *pb.RPC) topicstreams.RouteResult {
 	reply := make(chan topicstreams.RouteResult, 1)
-	if !s.send(routeOutboundRPC{rpc: rpc, reply: reply}) {
+	if !a.submit(routeOutboundRPC{generation: generation, rpc: rpc, reply: reply}) {
 		return topicstreams.RouteResult{Control: rpc}
 	}
-	return <-reply
-}
-func (s *outboundState) enabled() bool {
-	reply := make(chan bool, 1)
-	if !s.send(queryOutboundEnabled{reply}) {
-		return false
-	}
-	return <-reply
-}
-func (s *outboundState) close() {
-	done := make(chan struct{})
-	if s.send(closeOutboundState{done}) {
-		<-done
+	select {
+	case result := <-reply:
+		return result
+	case <-ctx.Done():
+		return topicstreams.RouteResult{Control: rpc}
+	case <-a.done:
+		return topicstreams.RouteResult{Control: rpc}
 	}
 }

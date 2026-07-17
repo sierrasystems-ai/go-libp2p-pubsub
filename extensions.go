@@ -127,13 +127,18 @@ const (
 	inboundRPCRejectControlPayload
 )
 
-// acceptInboundRPC is the canonical control-RPC admission operation. It first
-// derives the peer advertisement, validates payload placement against the
-// resulting negotiated state, then commits the first advertisement exactly
-// once. Topic-stream RPCs do not participate in control-stream negotiation.
-func (es *extensionsState) acceptInboundRPC(rpc *RPC) inboundRPCDisposition {
+type inboundExtensionCandidate struct {
+	peer       peer.ID
+	extensions PeerExtensions
+	first      bool
+	repeated   bool
+}
+
+// validateInboundRPC derives negotiation state without mutating it. The caller
+// commits the candidate only after the RPC passes every admission gate.
+func (es *extensionsState) validateInboundRPC(rpc *RPC) (inboundExtensionCandidate, inboundRPCDisposition) {
 	if rpc.viaTopicStream {
-		return inboundRPCAccept
+		return inboundExtensionCandidate{}, inboundRPCAccept
 	}
 
 	peerExtensions, known := es.peerExtensions[rpc.from]
@@ -142,18 +147,31 @@ func (es *extensionsState) acceptInboundRPC(rpc *RPC) inboundRPCDisposition {
 	}
 	_, sent := es.sentExtensions[rpc.from]
 	if es.myExtensions.TopicStreams && sent && peerExtensions.TopicStreams && (len(rpc.GetPublish()) > 0 || rpc.Partial != nil) {
-		return inboundRPCRejectControlPayload
+		return inboundExtensionCandidate{}, inboundRPCRejectControlPayload
 	}
+	return inboundExtensionCandidate{
+		peer:       rpc.from,
+		extensions: peerExtensions,
+		first:      !known,
+		repeated:   known && hasPeerExtensions(rpc),
+	}, inboundRPCAccept
+}
 
-	if !known {
-		es.peerExtensions[rpc.from] = peerExtensions
-		if sent {
-			es.extensionsOnNewOutboundStream(rpc.from)
-		}
-	} else if hasPeerExtensions(rpc) {
-		es.reportMisbehavior(rpc.from)
+func (es *extensionsState) commitInboundRPC(candidate inboundExtensionCandidate) {
+	if candidate.peer == "" {
+		return
 	}
-	return inboundRPCAccept
+	if candidate.repeated {
+		es.reportMisbehavior(candidate.peer)
+		return
+	}
+	if !candidate.first {
+		return
+	}
+	es.peerExtensions[candidate.peer] = candidate.extensions
+	if _, sent := es.sentExtensions[candidate.peer]; sent {
+		es.extensionsOnNewOutboundStream(candidate.peer)
+	}
 }
 
 func (es *extensionsState) HandleRPC(rpc *RPC) error {

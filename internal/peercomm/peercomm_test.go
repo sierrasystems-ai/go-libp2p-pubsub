@@ -194,12 +194,15 @@ func TestQueuedPayloadAfterUnsubscribeCannotRecreateWriter(t *testing.T) {
 	}, Hooks{})
 	actor := registry.For(peer.ID("peer"))
 	topics := topicstreams.NewOutboundStreams(ctx, remoteUnsubscribeHost{stream: stream}, peer.ID("peer"), 1, nil, registry.config.TopicStreamsHooks)
-	actor.outbound.attach(topics)
+	generation, ok := actor.beginOutboundSession()
+	if !ok || !actor.attachOutbound(generation, topics) {
+		t.Fatal("failed to establish outbound session")
+	}
 	actor.SetTopicStreamsEnabled(true)
 	actor.RemoteSubscribed("topic")
 
 	first := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic"), Data: []byte("first")}}}
-	if result := actor.outbound.route(first); result.Accepted != 1 {
+	if result := actor.routeOutbound(ctx, generation, first); result.Accepted != 1 {
 		t.Fatalf("first payload was not accepted: %#v", result)
 	}
 	select {
@@ -210,7 +213,7 @@ func TestQueuedPayloadAfterUnsubscribeCannotRecreateWriter(t *testing.T) {
 
 	actor.RemoteUnsubscribed("topic")
 	queued := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic"), Data: []byte("queued")}}}
-	result := actor.outbound.route(queued)
+	result := actor.routeOutbound(ctx, generation, queued)
 	if result.Accepted != 0 || result.Dropped != 1 {
 		t.Fatalf("stale queued payload disposition: %#v", result)
 	}
@@ -230,5 +233,42 @@ func TestQueuedPayloadAfterUnsubscribeCannotRecreateWriter(t *testing.T) {
 	}
 	if got := stream.writes.Load(); got != 2 {
 		t.Fatalf("queued payload recreated writer: got %d writes, want header plus first payload", got)
+	}
+}
+
+func TestOutboundSessionReplacementRetiresAuthorization(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := newRemoteUnsubscribeStream()
+	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{})
+	actor := registry.For(peer.ID("peer"))
+
+	firstGeneration, ok := actor.beginOutboundSession()
+	if !ok {
+		t.Fatal("failed to begin first session")
+	}
+	firstStreams := topicstreams.NewOutboundStreams(ctx, remoteUnsubscribeHost{stream: stream}, peer.ID("peer"), 1, nil, topicstreams.OutboundHooks{})
+	if !actor.attachOutbound(firstGeneration, firstStreams) {
+		t.Fatal("failed to attach first session streams")
+	}
+	actor.SetTopicStreamsEnabled(true)
+	actor.RemoteSubscribed("topic")
+
+	secondGeneration, ok := actor.beginOutboundSession()
+	if !ok || secondGeneration == firstGeneration {
+		t.Fatal("replacement did not create a distinct session")
+	}
+	secondStreams := topicstreams.NewOutboundStreams(ctx, remoteUnsubscribeHost{stream: stream}, peer.ID("peer"), 1, nil, topicstreams.OutboundHooks{})
+	if !actor.attachOutbound(secondGeneration, secondStreams) {
+		t.Fatal("failed to attach replacement streams")
+	}
+	actor.SetTopicStreamsEnabled(true)
+
+	rpc := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic")}}}
+	if result := actor.routeOutbound(ctx, firstGeneration, rpc); result.Accepted != 0 || result.Control != rpc {
+		t.Fatalf("retired generation routed payload: %#v", result)
+	}
+	if result := actor.routeOutbound(ctx, secondGeneration, rpc); result.Accepted != 0 || result.Dropped != 1 {
+		t.Fatalf("replacement inherited authorization: %#v", result)
 	}
 }

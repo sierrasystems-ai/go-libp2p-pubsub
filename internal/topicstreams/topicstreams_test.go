@@ -226,3 +226,33 @@ func TestWriterFailuresDropAcceptedEnvelopesExactlyOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestDropCallbackCanReenterOutboundStreams(t *testing.T) {
+	callbackDone := make(chan struct{})
+	var streams *OutboundStreams
+	streams = NewOutboundStreams(context.Background(), nil, peer.ID("peer"), 1, nil, OutboundHooks{
+		Drop: func(peer.ID, Envelope) {
+			streams.CloseTopic("topic")
+			close(callbackDone)
+		},
+	})
+	streams.Close()
+
+	sendDone := make(chan bool, 1)
+	go func() {
+		sendDone <- streams.Send(Envelope{Topic: "topic", Publish: &pb.Message{}})
+	}()
+	select {
+	case accepted := <-sendDone:
+		if accepted {
+			t.Fatal("closed streams accepted envelope")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reentrant Drop callback deadlocked Send")
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("Drop callback did not complete")
+	}
+}

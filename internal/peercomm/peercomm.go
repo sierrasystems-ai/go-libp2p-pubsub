@@ -107,7 +107,7 @@ func (r *Registry) For(pid peer.ID) *Actor {
 		return a
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
-	a := &Actor{registry: r, peer: pid, events: make(chan actorEvent, mailboxSize), done: make(chan struct{}), ctx: ctx, cancel: cancel, queue: newRPCQueue(r.config.OutboundQueueSize), outbound: newOutboundState(ctx)}
+	a := &Actor{registry: r, peer: pid, events: make(chan actorEvent, mailboxSize), done: make(chan struct{}), ctx: ctx, cancel: cancel, queue: newRPCQueue(r.config.OutboundQueueSize)}
 	r.peers[pid] = a
 	go a.run()
 	return a
@@ -160,7 +160,6 @@ type Actor struct {
 	cancel   context.CancelFunc
 	queue    *rpcQueue
 	started  atomic.Bool
-	outbound *outboundState
 }
 type actorEvent interface{ actorEvent() }
 
@@ -297,20 +296,45 @@ func (a *Actor) Terminate() {
 	a.queue.close()
 	a.cancel()
 }
-func (a *Actor) SetTopicStreamsEnabled(enabled bool) { a.outbound.setEnabled(enabled) }
+func (a *Actor) SetTopicStreamsEnabled(enabled bool) {
+	a.submit(setOutboundEnabled{enabled: enabled})
+}
 
-// TopicStreamsEnabled reports the actor's negotiated outbound routing state.
-func (a *Actor) TopicStreamsEnabled() bool { return a.outbound.enabled() }
+// TopicStreamsEnabled reports the current session's negotiated routing state.
+func (a *Actor) TopicStreamsEnabled() bool {
+	reply := make(chan bool, 1)
+	if !a.submit(queryOutboundEnabled{reply: reply}) {
+		return false
+	}
+	return <-reply
+}
 
-// CloseTopic closes the current topic writer without changing remote authorization.
-func (a *Actor) CloseTopic(topic string) { a.outbound.closeTopic(topic) }
+// CloseTopic closes the current session's topic writer without revoking authorization.
+func (a *Actor) CloseTopic(topic string) {
+	a.submit(closeOutboundTopic{topic: topic})
+}
 
-// RemoteSubscribed updates the outbound authorization generation for topic.
-func (a *Actor) RemoteSubscribed(topic string) { a.outbound.setAuthorized(topic, true) }
+func (a *Actor) RemoteSubscribed(topic string) {
+	done := make(chan struct{})
+	if a.submit(setTopicAuthorization{topic: topic, authorized: true, done: done}) {
+		select {
+		case <-done:
+		case <-a.done:
+		case <-a.ctx.Done():
+		}
+	}
+}
 
-// RemoteUnsubscribed revokes topic authorization and closes its writer in the
-// same serialized state transition used by routing.
-func (a *Actor) RemoteUnsubscribed(topic string) { a.outbound.setAuthorized(topic, false) }
+func (a *Actor) RemoteUnsubscribed(topic string) {
+	done := make(chan struct{})
+	if a.submit(setTopicAuthorization{topic: topic, done: done}) {
+		select {
+		case <-done:
+		case <-a.done:
+		case <-a.ctx.Done():
+		}
+	}
+}
 
 func (a *Actor) Stop() bool {
 	ack := make(chan struct{})
@@ -338,7 +362,8 @@ func (a *Actor) run() {
 	defer close(a.done)
 	defer a.cancel()
 	defer a.queue.close()
-	defer a.outbound.close()
+	outbound := outboundSession{generation: 1, authorizations: make(map[string]struct{})}
+	nextOutboundGeneration := uint64(1)
 	var control network.Stream
 	var controlSet bool
 	var controlGen, nextTopicID uint64
@@ -363,7 +388,7 @@ func (a *Actor) run() {
 		counts = make(map[string]int)
 		total = 0
 	}
-	closeOutbound := func() { a.outbound.detach() }
+	closeOutbound := func() { outbound.retire() }
 	retire := func() bool {
 		if controlSet || len(topics) > 0 || a.started.Load() {
 			return false
@@ -381,6 +406,65 @@ func (a *Actor) run() {
 		select {
 		case raw := <-a.events:
 			switch ev := raw.(type) {
+			case beginOutboundSession:
+				outbound.retire()
+				nextOutboundGeneration++
+				outbound = outboundSession{generation: nextOutboundGeneration, authorizations: make(map[string]struct{})}
+				ev.reply <- outbound.generation
+			case attachOutboundStreams:
+				if ev.generation != outbound.generation || ev.generation == 0 {
+					ev.streams.Close()
+					ev.reply <- false
+					continue
+				}
+				if outbound.streams != nil {
+					outbound.streams.Close()
+				}
+				outbound.streams = ev.streams
+				ev.reply <- true
+			case endOutboundSession:
+				if ev.generation == outbound.generation {
+					outbound.retire()
+				}
+				close(ev.done)
+			case setOutboundEnabled:
+				if !ev.enabled {
+					outbound.retire()
+				} else if outbound.generation != 0 {
+					outbound.enabled = true
+				}
+				if ev.done != nil {
+					close(ev.done)
+				}
+			case setTopicAuthorization:
+				if outbound.generation != 0 {
+					if ev.authorized {
+						outbound.authorizations[ev.topic] = struct{}{}
+					} else {
+						delete(outbound.authorizations, ev.topic)
+						if outbound.streams != nil {
+							outbound.streams.CloseTopic(ev.topic)
+						}
+					}
+				}
+				if ev.done != nil {
+					close(ev.done)
+				}
+			case closeOutboundTopic:
+				if outbound.streams != nil {
+					outbound.streams.CloseTopic(ev.topic)
+				}
+				if ev.done != nil {
+					close(ev.done)
+				}
+			case routeOutboundRPC:
+				if ev.generation != outbound.generation {
+					ev.reply <- topicstreams.RouteResult{Control: ev.rpc}
+				} else {
+					ev.reply <- outbound.route(ev.rpc)
+				}
+			case queryOutboundEnabled:
+				ev.reply <- outbound.enabled
 			case inboundControlOpen:
 				if controlSet && control != ev.stream {
 					control.Reset()
@@ -688,7 +772,14 @@ func (a *Actor) HandleInboundControl(s network.Stream) {
 func (a *Actor) runOutbound() {
 	h := a.registry.hooks
 	opened := false
-	defer func() { a.outboundTerminated(opened) }()
+	generation, ok := a.beginOutboundSession()
+	if !ok {
+		return
+	}
+	defer func() {
+		a.endOutbound(generation)
+		a.outboundTerminated(opened)
+	}()
 	if a.registry.config.Host == nil || h.Protocols == nil {
 		return
 	}
@@ -700,10 +791,7 @@ func (a *Actor) runOutbound() {
 	opened = true
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()
-	defer func() {
-		a.outbound.detach()
-		_ = s.Close()
-	}()
+	defer s.Close()
 	hello, ok := h.PrepareHello(ctx, a.peer, s.Protocol())
 	if !ok {
 		_ = s.Reset()
@@ -716,7 +804,9 @@ func (a *Actor) runOutbound() {
 		}
 	}
 	topics := topicstreams.NewOutboundStreams(ctx, a.registry.config.Host, a.peer, a.registry.config.OutboundQueueSize, a.registry.config.Logger, a.registry.config.TopicStreamsHooks)
-	a.outbound.attach(topics)
+	if !a.attachOutbound(generation, topics) {
+		return
+	}
 	go func() {
 		_, e := s.Read([]byte{0})
 		if e == nil {
@@ -730,7 +820,7 @@ func (a *Actor) runOutbound() {
 		if e != nil {
 			return
 		}
-		rpc = a.outbound.route(rpc).Control
+		rpc = a.routeOutbound(ctx, generation, rpc).Control
 		if rpc == nil {
 			continue
 		}
