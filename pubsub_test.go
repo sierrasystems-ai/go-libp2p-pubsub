@@ -2,6 +2,8 @@ package pubsub
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"runtime"
 	"testing"
 	"testing/synctest"
@@ -176,4 +178,42 @@ func TestPubSubRemovesBlacklistedPeer(t *testing.T) {
 		cancel()
 		time.Sleep(time.Millisecond * 100)
 	})
+}
+
+type admissionRouter struct {
+	FloodSubRouter
+	status  AcceptStatus
+	handled int
+}
+
+func (r *admissionRouter) AcceptFrom(peer.ID) AcceptStatus { return r.status }
+func (r *admissionRouter) HandleRPC(*RPC)                  { r.handled++ }
+
+func TestAdmissionControlsSubscriptionCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		status        AcceptStatus
+		wantCommitted bool
+		wantHandled   int
+	}{
+		{name: "none", status: AcceptNone},
+		{name: "control", status: AcceptControl, wantCommitted: true, wantHandled: 1},
+		{name: "all", status: AcceptAll, wantCommitted: true, wantHandled: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pid := peer.ID("peer")
+			topic := "topic"
+			subscribe := true
+			router := &admissionRouter{status: tc.status}
+			ps := &PubSub{rt: router, topics: make(map[string]map[peer.ID]peerTopicState), logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			ps.handleIncomingRPC(&RPC{RPC: pb.RPC{Subscriptions: []*pb.RPC_SubOpts{{Topicid: &topic, Subscribe: &subscribe}}}, from: pid})
+			_, committed := ps.topics[topic][pid]
+			if committed != tc.wantCommitted {
+				t.Fatalf("subscription committed=%v, want %v", committed, tc.wantCommitted)
+			}
+			if router.handled != tc.wantHandled {
+				t.Fatalf("HandleRPC calls=%d, want %d", router.handled, tc.wantHandled)
+			}
+		})
+	}
 }

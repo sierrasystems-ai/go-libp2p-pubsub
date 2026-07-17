@@ -19,9 +19,9 @@ func TestTopicStreamsNegotiationUpdatesExistingPeerComm(t *testing.T) {
 
 	pid := peer.ID("negotiated-peer")
 	actor := registry.For(pid)
-	extensions.OnNewOutboundStream(pid, &RPC{})
+	extensions.OnNewOutboundStream(pid, &RPC{session: actor.CurrentSession()})
 	remoteSupportsTopicStreams := true
-	rpc := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Extensions: &pb.ControlExtensions{TopicStreams: &remoteSupportsTopicStreams}}}, from: pid}
+	rpc := &RPC{session: actor.CurrentSession(), RPC: pb.RPC{Control: &pb.ControlMessage{Extensions: &pb.ControlExtensions{TopicStreams: &remoteSupportsTopicStreams}}}, from: pid}
 	candidate, disposition := extensions.validateInboundRPC(rpc)
 	if disposition != inboundRPCAccept {
 		t.Fatalf("first negotiation RPC was rejected: %v", disposition)
@@ -39,7 +39,7 @@ func TestTopicStreamsNegotiationUpdatesExistingPeerComm(t *testing.T) {
 	}
 
 	unknown := peer.ID("unknown-peer")
-	extensions.onTopicStreamsDisabled(unknown)
+	extensions.onTopicStreamsDisabled(unknown, peercomm.Session{})
 	if _, ok := registry.Existing(unknown); ok {
 		t.Fatal("disable event created a peer actor")
 	}

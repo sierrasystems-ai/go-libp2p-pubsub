@@ -12,6 +12,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/libp2p/go-libp2p-pubsub/internal/peercomm"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
 	"github.com/libp2p/go-libp2p/core/event"
@@ -2342,14 +2343,14 @@ func computeChecksum(mid string) checksum {
 }
 
 func wireTopicStreamsPeerComm(extensions *extensionsState, p *PubSub) {
-	extensions.onTopicStreamsEnabled = func(pid peer.ID) {
+	extensions.onTopicStreamsEnabled = func(pid peer.ID, session peercomm.Session) {
 		if comm, ok := p.existingPeerComm(pid); ok {
-			comm.SetTopicStreamsEnabled(true)
+			comm.SetTopicStreamsEnabled(session, true)
 		}
 	}
-	extensions.onTopicStreamsDisabled = func(pid peer.ID) {
+	extensions.onTopicStreamsDisabled = func(pid peer.ID, session peercomm.Session) {
 		if comm, ok := p.existingPeerComm(pid); ok {
-			comm.SetTopicStreamsEnabled(false)
+			comm.SetTopicStreamsEnabled(session, false)
 		}
 	}
 }

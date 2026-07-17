@@ -32,6 +32,9 @@ const (
 // Generation is an opaque token identifying one actor-owned stream generation.
 type Generation struct{ value uint64 }
 
+// Session is an opaque token identifying one outbound control-stream lifetime.
+type Session struct{ generation uint64 }
+
 // Admission is an opaque token for an admitted inbound topic stream.
 type Admission struct {
 	id, generation uint64
@@ -52,15 +55,16 @@ const (
 
 // InboundEvent is emitted in actor order.
 type InboundEvent struct {
-	Kind   InboundEventKind
-	RPC    *pb.RPC
-	Stream network.Stream
+	Kind    InboundEventKind
+	RPC     *pb.RPC
+	Stream  network.Stream
+	Session Session
 }
 
 // Hooks are callbacks into the embedding PubSub service.
 type Hooks struct {
 	Protocols            func() []protocol.ID
-	PrepareHello         func(context.Context, peer.ID, protocol.ID) (*pb.RPC, bool)
+	PrepareHello         func(context.Context, peer.ID, protocol.ID, Session) (*pb.RPC, bool)
 	OutboundOpenFailed   func(peer.ID)
 	OutboundDead         func(peer.ID)
 	EmitInbound          func(peer.ID, InboundEvent) bool
@@ -296,11 +300,19 @@ func (a *Actor) Terminate() {
 	a.queue.close()
 	a.cancel()
 }
-func (a *Actor) SetTopicStreamsEnabled(enabled bool) {
-	a.submit(setOutboundEnabled{enabled: enabled})
+func (a *Actor) SetTopicStreamsEnabled(session Session, enabled bool) {
+	a.submit(setOutboundEnabled{generation: session.generation, enabled: enabled})
 }
 
-// TopicStreamsEnabled reports the current session's negotiated routing state.
+// TopicStreamsEnabled reports the selected session's negotiated routing state.
+func (a *Actor) CurrentSession() Session {
+	reply := make(chan uint64, 1)
+	if !a.submit(queryOutboundSession{reply: reply}) {
+		return Session{}
+	}
+	return Session{<-reply}
+}
+
 func (a *Actor) TopicStreamsEnabled() bool {
 	reply := make(chan bool, 1)
 	if !a.submit(queryOutboundEnabled{reply: reply}) {
@@ -309,31 +321,14 @@ func (a *Actor) TopicStreamsEnabled() bool {
 	return <-reply
 }
 
-// CloseTopic closes the current session's topic writer without revoking authorization.
-func (a *Actor) CloseTopic(topic string) {
-	a.submit(closeOutboundTopic{topic: topic})
+// RemoteSubscribed asynchronously authorizes a topic for the event's session.
+func (a *Actor) RemoteSubscribed(session Session, topic string) {
+	a.submit(setTopicAuthorization{generation: session.generation, topic: topic, authorized: true})
 }
 
-func (a *Actor) RemoteSubscribed(topic string) {
-	done := make(chan struct{})
-	if a.submit(setTopicAuthorization{topic: topic, authorized: true, done: done}) {
-		select {
-		case <-done:
-		case <-a.done:
-		case <-a.ctx.Done():
-		}
-	}
-}
-
-func (a *Actor) RemoteUnsubscribed(topic string) {
-	done := make(chan struct{})
-	if a.submit(setTopicAuthorization{topic: topic, done: done}) {
-		select {
-		case <-done:
-		case <-a.done:
-		case <-a.ctx.Done():
-		}
-	}
+// RemoteUnsubscribed asynchronously revokes a topic for the event's session.
+func (a *Actor) RemoteUnsubscribed(session Session, topic string) {
+	a.submit(setTopicAuthorization{generation: session.generation, topic: topic})
 }
 
 func (a *Actor) Stop() bool {
@@ -428,16 +423,16 @@ func (a *Actor) run() {
 				}
 				close(ev.done)
 			case setOutboundEnabled:
+				if ev.generation != outbound.generation {
+					continue
+				}
 				if !ev.enabled {
 					outbound.retire()
 				} else if outbound.generation != 0 {
 					outbound.enabled = true
 				}
-				if ev.done != nil {
-					close(ev.done)
-				}
 			case setTopicAuthorization:
-				if outbound.generation != 0 {
+				if ev.generation == outbound.generation && outbound.generation != 0 {
 					if ev.authorized {
 						outbound.authorizations[ev.topic] = struct{}{}
 					} else {
@@ -447,29 +442,21 @@ func (a *Actor) run() {
 						}
 					}
 				}
-				if ev.done != nil {
-					close(ev.done)
-				}
-			case closeOutboundTopic:
-				if outbound.streams != nil {
-					outbound.streams.CloseTopic(ev.topic)
-				}
-				if ev.done != nil {
-					close(ev.done)
-				}
 			case routeOutboundRPC:
 				if ev.generation != outbound.generation {
-					ev.reply <- topicstreams.RouteResult{Control: ev.rpc}
+					ev.reply <- routeReply{disposition: routeStale, RouteResult: topicstreams.RouteResult{Control: ev.rpc}}
 				} else {
-					ev.reply <- outbound.route(ev.rpc)
+					ev.reply <- routeReply{disposition: routeCompleted, RouteResult: outbound.route(ev.rpc)}
 				}
+			case queryOutboundSession:
+				ev.reply <- outbound.generation
 			case queryOutboundEnabled:
-				ev.reply <- outbound.enabled
+				ev.reply <- (ev.generation == 0 || ev.generation == outbound.generation) && outbound.enabled
 			case inboundControlOpen:
 				if controlSet && control != ev.stream {
 					control.Reset()
 					closeTopics()
-					emit(InboundEvent{Kind: InboundControlClosed, Stream: control})
+					emit(InboundEvent{Kind: InboundControlClosed, Stream: control, Session: Session{outbound.generation}})
 				}
 				controlGen++
 				control = ev.stream
@@ -480,13 +467,13 @@ func (a *Actor) run() {
 						t.generation = controlGen
 					}
 				}
-				emit(InboundEvent{Kind: InboundControlOpened, Stream: ev.stream})
+				emit(InboundEvent{Kind: InboundControlOpened, Stream: ev.stream, Session: Session{outbound.generation}})
 				ev.reply <- Generation{controlGen}
 			case inboundControlRPC:
 				if ev.generation.value != controlGen || !controlSet {
 					continue
 				}
-				if !emit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control}) {
+				if !emit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control, Session: Session{outbound.generation}}) {
 					shutdown()
 					return
 				}
@@ -496,7 +483,7 @@ func (a *Actor) run() {
 						if t.generation == controlGen && t.pending != nil {
 							ok := false
 							if time.Now().Before(t.pending.deadline) {
-								ok = emit(InboundEvent{Kind: InboundTopicRPC, RPC: t.pending.rpc, Stream: t.stream})
+								ok = emit(InboundEvent{Kind: InboundTopicRPC, RPC: t.pending.rpc, Stream: t.stream, Session: Session{outbound.generation}})
 							}
 							t.pending.reply <- ok
 							t.pending = nil
@@ -508,7 +495,7 @@ func (a *Actor) run() {
 					continue
 				}
 				closeTopics()
-				emit(InboundEvent{Kind: InboundControlClosed, Stream: ev.stream})
+				emit(InboundEvent{Kind: InboundControlClosed, Stream: ev.stream, Session: Session{outbound.generation}})
 				controlSet = false
 				firstControl = false
 				if retire() {
@@ -561,7 +548,7 @@ func (a *Actor) run() {
 					continue
 				}
 				if time.Now().Before(ev.deadline) {
-					ev.reply <- emit(InboundEvent{Kind: InboundTopicRPC, RPC: ev.rpc, Stream: t.stream})
+					ev.reply <- emit(InboundEvent{Kind: InboundTopicRPC, RPC: ev.rpc, Stream: t.stream, Session: Session{outbound.generation}})
 				} else {
 					ev.reply <- false
 				}
@@ -792,7 +779,7 @@ func (a *Actor) runOutbound() {
 	ctx, cancel := context.WithCancel(a.ctx)
 	defer cancel()
 	defer s.Close()
-	hello, ok := h.PrepareHello(ctx, a.peer, s.Protocol())
+	hello, ok := h.PrepareHello(ctx, a.peer, s.Protocol(), Session{generation})
 	if !ok {
 		_ = s.Reset()
 		return
@@ -820,7 +807,11 @@ func (a *Actor) runOutbound() {
 		if e != nil {
 			return
 		}
-		rpc = a.routeOutbound(ctx, generation, rpc).Control
+		routed := a.routeOutbound(ctx, generation, rpc)
+		if routed.disposition == routeAborted {
+			continue
+		}
+		rpc = routed.Control
 		if rpc == nil {
 			continue
 		}

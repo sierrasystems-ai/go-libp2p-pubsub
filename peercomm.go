@@ -42,9 +42,9 @@ func (p *PubSub) initPeerComms() {
 		TopicStreamViolation: p.abortTopicStreamsConnection,
 	}, peercomm.Hooks{
 		Protocols: p.rt.Protocols,
-		PrepareHello: func(ctx context.Context, pid peer.ID, proto protocol.ID) (*pb.RPC, bool) {
+		PrepareHello: func(ctx context.Context, pid peer.ID, proto protocol.ID, session peercomm.Session) (*pb.RPC, bool) {
 			response := make(chan prepareOutboundResponse, 1)
-			request := prepareOutboundRequest{peer: pid, protocol: proto, response: response}
+			request := prepareOutboundRequest{peer: pid, protocol: proto, session: session, response: response}
 			select {
 			case p.prepareOutbound <- request:
 			case <-ctx.Done():
@@ -70,6 +70,7 @@ func (p *PubSub) initPeerComms() {
 			case peercomm.InboundRPC, peercomm.InboundTopicRPC:
 				in.kind = incomingKindRPC
 				in.rpc = wrapPeerRPC(ev.RPC, pid, ev.Kind == peercomm.InboundTopicRPC)
+				in.rpc.session = ev.Session
 				if ev.Stream != nil {
 					in.rpc.conn = ev.Stream.Conn()
 				}

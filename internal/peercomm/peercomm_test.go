@@ -198,8 +198,8 @@ func TestQueuedPayloadAfterUnsubscribeCannotRecreateWriter(t *testing.T) {
 	if !ok || !actor.attachOutbound(generation, topics) {
 		t.Fatal("failed to establish outbound session")
 	}
-	actor.SetTopicStreamsEnabled(true)
-	actor.RemoteSubscribed("topic")
+	actor.SetTopicStreamsEnabled(Session{generation}, true)
+	actor.RemoteSubscribed(Session{generation}, "topic")
 
 	first := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic"), Data: []byte("first")}}}
 	if result := actor.routeOutbound(ctx, generation, first); result.Accepted != 1 {
@@ -211,7 +211,7 @@ func TestQueuedPayloadAfterUnsubscribeCannotRecreateWriter(t *testing.T) {
 		t.Fatal("outbound topic stream did not start")
 	}
 
-	actor.RemoteUnsubscribed("topic")
+	actor.RemoteUnsubscribed(Session{generation}, "topic")
 	queued := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic"), Data: []byte("queued")}}}
 	result := actor.routeOutbound(ctx, generation, queued)
 	if result.Accepted != 0 || result.Dropped != 1 {
@@ -251,8 +251,8 @@ func TestOutboundSessionReplacementRetiresAuthorization(t *testing.T) {
 	if !actor.attachOutbound(firstGeneration, firstStreams) {
 		t.Fatal("failed to attach first session streams")
 	}
-	actor.SetTopicStreamsEnabled(true)
-	actor.RemoteSubscribed("topic")
+	actor.SetTopicStreamsEnabled(Session{firstGeneration}, true)
+	actor.RemoteSubscribed(Session{firstGeneration}, "topic")
 
 	secondGeneration, ok := actor.beginOutboundSession()
 	if !ok || secondGeneration == firstGeneration {
@@ -262,7 +262,7 @@ func TestOutboundSessionReplacementRetiresAuthorization(t *testing.T) {
 	if !actor.attachOutbound(secondGeneration, secondStreams) {
 		t.Fatal("failed to attach replacement streams")
 	}
-	actor.SetTopicStreamsEnabled(true)
+	actor.SetTopicStreamsEnabled(Session{secondGeneration}, true)
 
 	rpc := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic")}}}
 	if result := actor.routeOutbound(ctx, firstGeneration, rpc); result.Accepted != 0 || result.Control != rpc {
@@ -270,5 +270,91 @@ func TestOutboundSessionReplacementRetiresAuthorization(t *testing.T) {
 	}
 	if result := actor.routeOutbound(ctx, secondGeneration, rpc); result.Accepted != 0 || result.Dropped != 1 {
 		t.Fatalf("replacement inherited authorization: %#v", result)
+	}
+}
+
+func TestStaleSessionMutationsIgnored(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{})
+	actor := registry.For(peer.ID("peer"))
+	first, ok := actor.beginOutboundSession()
+	if !ok {
+		t.Fatal("first session")
+	}
+	second, ok := actor.beginOutboundSession()
+	if !ok {
+		t.Fatal("second session")
+	}
+	stale := Session{first}
+	current := Session{second}
+	actor.SetTopicStreamsEnabled(stale, true)
+	actor.RemoteSubscribed(stale, "topic")
+	actor.RemoteUnsubscribed(stale, "topic")
+	if actor.TopicStreamsEnabled() {
+		t.Fatal("stale enable mutated replacement")
+	}
+	actor.SetTopicStreamsEnabled(current, true)
+	if !actor.TopicStreamsEnabled() {
+		t.Fatal("current enable was ignored")
+	}
+	actor.SetTopicStreamsEnabled(stale, false)
+	if !actor.TopicStreamsEnabled() {
+		t.Fatal("stale disable mutated replacement")
+	}
+}
+
+func TestProcessLoopMutationDoesNotWaitForBlockedActor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	emitting := make(chan struct{})
+	release := make(chan struct{})
+	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{EmitInbound: func(_ peer.ID, event InboundEvent) bool {
+		if event.Kind == InboundRPC {
+			close(emitting)
+			<-release
+		}
+		return true
+	}})
+	actor := registry.For(peer.ID("peer"))
+	generation, ok := actor.OpenInboundControl(newRemoteUnsubscribeStream())
+	if !ok {
+		t.Fatal("open inbound control")
+	}
+	actor.DeliverInboundControl(generation, &pb.RPC{})
+	select {
+	case <-emitting:
+	case <-time.After(time.Second):
+		t.Fatal("actor did not enter inbound delivery")
+	}
+	done := make(chan struct{})
+	go func() {
+		actor.RemoteSubscribed(Session{generation: 1}, "topic")
+		actor.RemoteUnsubscribed(Session{generation: 1}, "topic")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("process-loop mutation waited for actor")
+	}
+	close(release)
+}
+
+func TestRouteCancellationNeverFallsBackToControl(t *testing.T) {
+	registryCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	registry := NewRegistry(registryCtx, Config{OutboundQueueSize: 1}, Hooks{})
+	actor := registry.For(peer.ID("peer"))
+	generation, ok := actor.beginOutboundSession()
+	if !ok {
+		t.Fatal("session")
+	}
+	cancel()
+	rpc := &pb.RPC{Publish: []*pb.Message{{Topic: proto.String("topic")}}}
+	result := actor.routeOutbound(ctx, generation, rpc)
+	if result.disposition != routeAborted || result.Control != nil {
+		t.Fatalf("canceled route manufactured control fallback: %#v", result)
 	}
 }

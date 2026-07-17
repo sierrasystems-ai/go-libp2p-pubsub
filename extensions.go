@@ -4,6 +4,7 @@ import (
 	"errors"
 	"iter"
 
+	"github.com/libp2p/go-libp2p-pubsub/internal/peercomm"
 	"github.com/libp2p/go-libp2p-pubsub/partialmessages"
 	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -96,7 +97,8 @@ type partialMessageInterface interface {
 type extensionsState struct {
 	myExtensions      PeerExtensions
 	peerExtensions    map[peer.ID]PeerExtensions // peer's extensions
-	sentExtensions    map[peer.ID]struct{}
+	sentExtensions    map[peer.ID]peercomm.Session
+	receivedSessions  map[peer.ID]peercomm.Session
 	reportMisbehavior func(peer.ID)
 	sendRPC           func(p peer.ID, r *RPC, urgent bool)
 	testExtension     *testExtension
@@ -105,15 +107,16 @@ type extensionsState struct {
 
 	// onTopicStreamsEnabled / onTopicStreamsDisabled are invoked once the Topic
 	// Streams extension is mutually negotiated (or torn down) with a peer.
-	onTopicStreamsEnabled  func(peer.ID)
-	onTopicStreamsDisabled func(peer.ID)
+	onTopicStreamsEnabled  func(peer.ID, peercomm.Session)
+	onTopicStreamsDisabled func(peer.ID, peercomm.Session)
 }
 
 func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool)) *extensionsState {
 	return &extensionsState{
 		myExtensions:      myExtensions,
 		peerExtensions:    make(map[peer.ID]PeerExtensions),
-		sentExtensions:    make(map[peer.ID]struct{}),
+		sentExtensions:    make(map[peer.ID]peercomm.Session),
+		receivedSessions:  make(map[peer.ID]peercomm.Session),
 		reportMisbehavior: reportMisbehavior,
 		sendRPC:           sendRPC,
 		testExtension:     nil,
@@ -124,6 +127,7 @@ type inboundRPCDisposition uint8
 
 const (
 	inboundRPCAccept inboundRPCDisposition = iota
+	inboundRPCIgnoreStale
 	inboundRPCRejectControlPayload
 )
 
@@ -132,6 +136,7 @@ type inboundExtensionCandidate struct {
 	extensions PeerExtensions
 	first      bool
 	repeated   bool
+	session    peercomm.Session
 }
 
 // validateInboundRPC derives negotiation state without mutating it. The caller
@@ -139,6 +144,10 @@ type inboundExtensionCandidate struct {
 func (es *extensionsState) validateInboundRPC(rpc *RPC) (inboundExtensionCandidate, inboundRPCDisposition) {
 	if rpc.viaTopicStream {
 		return inboundExtensionCandidate{}, inboundRPCAccept
+	}
+
+	if sent, ok := es.sentExtensions[rpc.from]; ok && sent != rpc.session {
+		return inboundExtensionCandidate{}, inboundRPCIgnoreStale
 	}
 
 	peerExtensions, known := es.peerExtensions[rpc.from]
@@ -154,6 +163,7 @@ func (es *extensionsState) validateInboundRPC(rpc *RPC) (inboundExtensionCandida
 		extensions: peerExtensions,
 		first:      !known,
 		repeated:   known && hasPeerExtensions(rpc),
+		session:    rpc.session,
 	}, inboundRPCAccept
 }
 
@@ -169,8 +179,9 @@ func (es *extensionsState) commitInboundRPC(candidate inboundExtensionCandidate)
 		return
 	}
 	es.peerExtensions[candidate.peer] = candidate.extensions
-	if _, sent := es.sentExtensions[candidate.peer]; sent {
-		es.extensionsOnNewOutboundStream(candidate.peer)
+	es.receivedSessions[candidate.peer] = candidate.session
+	if session, sent := es.sentExtensions[candidate.peer]; sent {
+		es.extensionsOnNewOutboundStream(candidate.peer, session)
 	}
 }
 
@@ -183,9 +194,10 @@ func (es *extensionsState) OnNewIncomingStream(peer.ID, protocol.ID) {
 
 func (es *extensionsState) OnClosedIncomingStream(id peer.ID, _ protocol.ID) {
 	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsDisabled != nil {
-		es.onTopicStreamsDisabled(id)
+		es.onTopicStreamsDisabled(id, es.receivedSessions[id])
 	}
 	delete(es.peerExtensions, id)
+	delete(es.receivedSessions, id)
 	if len(es.peerExtensions) == 0 {
 		es.peerExtensions = make(map[peer.ID]PeerExtensions)
 	}
@@ -195,36 +207,36 @@ func (es *extensionsState) OnNewOutboundStream(id peer.ID, helloPacket *RPC) *RP
 	// Send our extensions as the first message.
 	helloPacket = es.myExtensions.ExtendRPC(helloPacket)
 
-	es.sentExtensions[id] = struct{}{}
+	es.sentExtensions[id] = helloPacket.session
 	if _, ok := es.peerExtensions[id]; ok {
 		// We've just finished sending and receiving the extensions control
 		// message.
-		es.extensionsOnNewOutboundStream(id)
+		es.extensionsOnNewOutboundStream(id, helloPacket.session)
 	}
 	return helloPacket
 }
 
 func (es *extensionsState) OnClosedOutboundStream(id peer.ID) {
 	_, recvdExt := es.peerExtensions[id]
-	_, sentExt := es.sentExtensions[id]
+	session, sentExt := es.sentExtensions[id]
 	if recvdExt && sentExt {
 		// Add peer was previously called, so we need to call remove peer
-		es.extensionsOnClosedOutboundStream(id)
+		es.extensionsOnClosedOutboundStream(id, session)
 	}
 	delete(es.sentExtensions, id)
 	if len(es.sentExtensions) == 0 {
-		es.sentExtensions = make(map[peer.ID]struct{})
+		es.sentExtensions = make(map[peer.ID]peercomm.Session)
 	}
 }
 
 // extensionsOnNewOutboundStream is only called once we've both sent and received the
 // extensions control message.
-func (es *extensionsState) extensionsOnNewOutboundStream(id peer.ID) {
+func (es *extensionsState) extensionsOnNewOutboundStream(id peer.ID, session peercomm.Session) {
 	if es.myExtensions.TestExtension && es.peerExtensions[id].TestExtension {
 		es.testExtension.OnNewOutboundStream(id)
 	}
 	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsEnabled != nil {
-		es.onTopicStreamsEnabled(id)
+		es.onTopicStreamsEnabled(id, session)
 	}
 }
 
@@ -237,12 +249,12 @@ func (es *extensionsState) topicStreamsNegotiated(id peer.ID) bool {
 }
 
 // extensionsOnClosedOutboundStream is always called after extensionsOnNewOutboundStream.
-func (es *extensionsState) extensionsOnClosedOutboundStream(id peer.ID) {
+func (es *extensionsState) extensionsOnClosedOutboundStream(id peer.ID, session peercomm.Session) {
 	if es.myExtensions.PartialMessages && es.peerExtensions[id].PartialMessages {
 		es.partialMessagesExtension.OnClosedOutboundStream(id)
 	}
 	if es.myExtensions.TopicStreams && es.peerExtensions[id].TopicStreams && es.onTopicStreamsDisabled != nil {
-		es.onTopicStreamsDisabled(id)
+		es.onTopicStreamsDisabled(id, session)
 	}
 }
 

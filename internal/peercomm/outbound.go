@@ -29,6 +29,13 @@ func (s *outboundSession) retire() {
 }
 
 func (s *outboundSession) route(rpc *pb.RPC) topicstreams.RouteResult {
+	if s.streams != nil {
+		for _, subscription := range rpc.GetSubscriptions() {
+			if !subscription.GetSubscribe() {
+				s.streams.CloseTopic(subscription.GetTopicid())
+			}
+		}
+	}
 	if !s.enabled || s.streams == nil {
 		return topicstreams.RouteResult{Control: rpc}
 	}
@@ -49,24 +56,37 @@ type endOutboundSession struct {
 	done       chan struct{}
 }
 type setOutboundEnabled struct {
-	enabled bool
-	done    chan struct{}
+	generation uint64
+	enabled    bool
 }
 type setTopicAuthorization struct {
+	generation uint64
 	topic      string
 	authorized bool
-	done       chan struct{}
 }
-type closeOutboundTopic struct {
-	topic string
-	done  chan struct{}
+type routeDisposition uint8
+
+const (
+	routeAborted routeDisposition = iota
+	routeStale
+	routeCompleted
+)
+
+type routeReply struct {
+	topicstreams.RouteResult
+	disposition routeDisposition
 }
+
 type routeOutboundRPC struct {
 	generation uint64
 	rpc        *pb.RPC
-	reply      chan topicstreams.RouteResult
+	reply      chan routeReply
 }
-type queryOutboundEnabled struct{ reply chan bool }
+type queryOutboundSession struct{ reply chan uint64 }
+type queryOutboundEnabled struct {
+	generation uint64
+	reply      chan bool
+}
 
 type outboundActorEvent interface {
 	actorEvent
@@ -78,16 +98,16 @@ func (attachOutboundStreams) actorEvent()         {}
 func (endOutboundSession) actorEvent()            {}
 func (setOutboundEnabled) actorEvent()            {}
 func (setTopicAuthorization) actorEvent()         {}
-func (closeOutboundTopic) actorEvent()            {}
 func (routeOutboundRPC) actorEvent()              {}
+func (queryOutboundSession) actorEvent()          {}
 func (queryOutboundEnabled) actorEvent()          {}
 func (beginOutboundSession) outboundActorEvent()  {}
 func (attachOutboundStreams) outboundActorEvent() {}
 func (endOutboundSession) outboundActorEvent()    {}
 func (setOutboundEnabled) outboundActorEvent()    {}
 func (setTopicAuthorization) outboundActorEvent() {}
-func (closeOutboundTopic) outboundActorEvent()    {}
 func (routeOutboundRPC) outboundActorEvent()      {}
+func (queryOutboundSession) outboundActorEvent()  {}
 func (queryOutboundEnabled) outboundActorEvent()  {}
 
 func (a *Actor) beginOutboundSession() (uint64, bool) {
@@ -134,17 +154,17 @@ func (a *Actor) endOutbound(generation uint64) {
 	}
 }
 
-func (a *Actor) routeOutbound(ctx context.Context, generation uint64, rpc *pb.RPC) topicstreams.RouteResult {
-	reply := make(chan topicstreams.RouteResult, 1)
+func (a *Actor) routeOutbound(ctx context.Context, generation uint64, rpc *pb.RPC) routeReply {
+	reply := make(chan routeReply, 1)
 	if !a.submit(routeOutboundRPC{generation: generation, rpc: rpc, reply: reply}) {
-		return topicstreams.RouteResult{Control: rpc}
+		return routeReply{disposition: routeAborted}
 	}
 	select {
 	case result := <-reply:
 		return result
 	case <-ctx.Done():
-		return topicstreams.RouteResult{Control: rpc}
+		return routeReply{disposition: routeAborted}
 	case <-a.done:
-		return topicstreams.RouteResult{Control: rpc}
+		return routeReply{disposition: routeAborted}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p-pubsub/internal/gologshim"
+	"github.com/libp2p/go-libp2p-pubsub/internal/peercomm"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p-pubsub/timecache"
 
@@ -57,6 +58,7 @@ type peerTopicState struct {
 type prepareOutboundRequest struct {
 	peer     peer.ID
 	protocol protocol.ID
+	session  peercomm.Session
 	response chan prepareOutboundResponse
 }
 
@@ -329,6 +331,10 @@ type RPC struct {
 	// RPCs never carry the extensions control message and are subject to the
 	// topic-stream scoring rules.
 	viaTopicStream bool
+
+	// session scopes control-derived mutations to the outbound generation that
+	// was current when this inbound event was serialized.
+	session peercomm.Session
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -1021,7 +1027,18 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			}
 
 			helloPacket := p.getHelloPacket()
+			helloPacket.session = req.session
 			helloPacket = p.rt.OnNewOutboundStream(req.peer, req.protocol, helloPacket)
+			// Rebuild session authorization from canonical subscription state.
+			// Inbound subscription events may predate this outbound generation and
+			// therefore cannot safely authorize it directly.
+			if comm, ok := p.existingPeerComm(req.peer); ok {
+				for topic, peers := range p.topics {
+					if _, subscribed := peers[req.peer]; subscribed {
+						comm.RemoteSubscribed(req.session, topic)
+					}
+				}
+			}
 			req.response <- prepareOutboundResponse{rpc: &helloPacket.RPC, ok: true}
 
 		case pid := <-p.newPeerError:
@@ -1409,9 +1426,6 @@ func (p *PubSub) announce(topic string, sub bool) {
 
 	out := rpcWithSubs(subopt)
 	for pid, peer := range p.activePeers {
-		if !sub {
-			peer.CloseTopic(topic)
-		}
 		err := peer.Send(&out.RPC, false)
 		if err != nil {
 			p.logger.Info("Can't send announce message to peer: queue full; scheduling retry", "peer", pid)
@@ -1547,6 +1561,9 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	if gs, ok := p.rt.(*GossipSubRouter); ok {
 		var disposition inboundRPCDisposition
 		extensionCandidate, disposition = gs.extensions.validateInboundRPC(rpc)
+		if disposition == inboundRPCIgnoreStale {
+			return
+		}
 		if disposition == inboundRPCRejectControlPayload {
 			p.abortTopicStreamsConnection(rpc.conn, "application payload sent on control stream")
 			return
@@ -1574,14 +1591,20 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		}
 	}
 
+	acceptStatus := p.rt.AcceptFrom(rpc.from)
+	if acceptStatus == AcceptNone {
+		p.logger.Debug("received RPC from router graylisted peer; dropping RPC", "peer", rpc.from)
+		return
+	}
+
 	for _, subopt := range subs {
 		t := subopt.GetTopicid()
 
 		if comm, ok := p.existingPeerComm(rpc.from); ok {
 			if subopt.GetSubscribe() {
-				comm.RemoteSubscribed(t)
+				comm.RemoteSubscribed(rpc.session, t)
 			} else {
-				comm.RemoteUnsubscribed(t)
+				comm.RemoteUnsubscribed(rpc.session, t)
 			}
 		}
 		if subopt.GetSubscribe() {
@@ -1619,14 +1642,8 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		}
 	}
 
-	// Extension negotiation commits only after inspection, subscription
-	// filtering, and router admission. Subscription bookkeeping intentionally
-	// remains before AcceptFrom because router gates consume that state.
-	acceptStatus := p.rt.AcceptFrom(rpc.from)
-	if acceptStatus == AcceptNone {
-		p.logger.Debug("received RPC from router graylisted peer; dropping RPC", "peer", rpc.from)
-		return
-	}
+	// AcceptControl admits subscriptions, control, and extension negotiation;
+	// only application payload processing is suppressed below.
 	if gs, ok := p.rt.(*GossipSubRouter); ok {
 		gs.extensions.commitInboundRPC(extensionCandidate)
 	}
