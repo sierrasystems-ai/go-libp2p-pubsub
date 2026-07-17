@@ -4909,13 +4909,7 @@ func TestPartialMessages(t *testing.T) {
 					}
 					partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
 				},
-				ClonePeerState: func(state peerState) peerState {
-					state.sent = append(bitmap.Bitmap(nil), state.sent...)
-					state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-					return state
-				},
-				OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
-					peerStates := tx.PeerStates()
+				OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 					peerState := peerStates[from]
 					groupID := rpc.GroupID
 					pm, ok := partialMessageStore[i][topic+string(groupID)]
@@ -5042,13 +5036,7 @@ func TestPartialMessagesEmitGossipWhenAllPeersPartial(t *testing.T) {
 					}
 					partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
 				},
-				ClonePeerState: func(state peerState) peerState {
-					state.sent = append(bitmap.Bitmap(nil), state.sent...)
-					state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-					return state
-				},
-				OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
-					peerStates := tx.PeerStates()
+				OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 					peerState := peerStates[from]
 					groupID := rpc.GroupID
 					pm, ok := partialMessageStore[i][topic+string(groupID)]
@@ -5184,13 +5172,7 @@ func TestPeerSupportsPartialMessages(t *testing.T) {
 					}
 					partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
 				},
-				ClonePeerState: func(state peerState) peerState {
-					state.sent = append(bitmap.Bitmap(nil), state.sent...)
-					state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-					return state
-				},
-				OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
-					peerStates := tx.PeerStates()
+				OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 					peerState := peerStates[from]
 					if from == hosts[1].ID() {
 						panic("peer 1 does not support partial messages, so should not send a partial message RPC")
@@ -5393,13 +5375,7 @@ func TestSkipPublishingToPeersRequestingPartialMessages(t *testing.T) {
 					}
 					partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
 				},
-				ClonePeerState: func(state peerState) peerState {
-					state.sent = append(bitmap.Bitmap(nil), state.sent...)
-					state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-					return state
-				},
-				OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
-					peerStates := tx.PeerStates()
+				OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 					peerState := peerStates[from]
 					topicID := rpc.GetTopicID()
 					groupID := rpc.GetGroupID()
@@ -5560,13 +5536,7 @@ func TestPairwiseInteractionWithPartialMessages(t *testing.T) {
 							}
 							partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
 						},
-						ClonePeerState: func(state peerState) peerState {
-							state.sent = append(bitmap.Bitmap(nil), state.sent...)
-							state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-							return state
-						},
-						OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
-							peerStates := tx.PeerStates()
+						OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 							peerState := peerStates[from]
 							if tc.hostSupport[i] == PeerSupportsPartialMessages && len(rpc.PartialMessage) > 0 {
 								panic("This host should not have received partial message data")
@@ -5734,12 +5704,7 @@ func TestNoIDONTWANTWithPartialMessage(t *testing.T) {
 							OnEmitGossip: func(topic string, groupID []byte, gossipPeers []peer.ID, peerStates map[peer.ID]peerState) {
 							},
 							Logger: slog.Default(),
-							ClonePeerState: func(state peerState) peerState {
-								state.sent = append(bitmap.Bitmap(nil), state.sent...)
-								state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-								return state
-							},
-							OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
+							OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 								return nil
 							},
 						},

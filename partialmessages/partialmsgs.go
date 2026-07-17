@@ -60,24 +60,6 @@ func (s *partialMessageStatePerGroupPerTopic[P]) remotePeerInitiated() bool {
 	return s.initiatedBy != ""
 }
 
-// IncomingRPCTransaction isolates callback state until HandleRPC accepts the RPC.
-// PeerStates returns a mutable snapshot; mutations become canonical only when the
-// callback returns nil. Defer records side effects to run once, after commit.
-type IncomingRPCTransaction[PeerState any] struct {
-	peerStates map[peer.ID]PeerState
-	deferred   []func()
-}
-
-func (tx *IncomingRPCTransaction[PeerState]) PeerStates() map[peer.ID]PeerState {
-	return tx.peerStates
-}
-
-func (tx *IncomingRPCTransaction[PeerState]) Defer(effect func()) {
-	if effect != nil {
-		tx.deferred = append(tx.deferred, effect)
-	}
-}
-
 type PartialMessagesExtension[PeerState any] struct {
 	Logger *slog.Logger
 
@@ -102,14 +84,8 @@ type PartialMessagesExtension[PeerState any] struct {
 	//  - peer's received state (we can infer they have a part if they have given it us)
 	//  - our last update to a peer (they can infer an update if they have given us a part)
 	//
-	// If the RPC should be ignored, leave tx.PeerStates unmodified. Canonical
-	// state is replaced only when this callback returns nil. Side effects that
-	// depend on acceptance must be registered with tx.Defer.
-	OnIncomingRPC func(from peer.ID, tx *IncomingRPCTransaction[PeerState], rpc *pb.PartialMessagesExtension) error
-
-	// ClonePeerState must return a deep-enough clone that callback mutation cannot
-	// reach canonical state through pointers, slices, maps, or other references.
-	ClonePeerState func(PeerState) PeerState
+	// If the rpc should be ignored, the application can leave peerStates unmodified
+	OnIncomingRPC func(from peer.ID, peerStates map[peer.ID]PeerState, rpc *pb.PartialMessagesExtension) error
 
 	// PeerInitiatedGroupLimitPerTopic limits the number of Group states all
 	// peers can initialize per topic. A group state is initialized by a peer if
@@ -180,9 +156,6 @@ func (e *PartialMessagesExtension[PeerState]) Init(router Router) error {
 	}
 	if e.OnEmitGossip == nil {
 		return errors.New("field OnEmitGossip must be set")
-	}
-	if e.ClonePeerState == nil {
-		return errors.New("field ClonePeerState must be set")
 	}
 
 	if e.PeerInitiatedGroupLimitPerTopic == 0 {
@@ -340,12 +313,10 @@ func (e *PartialMessagesExtension[PeerState]) HandleRPC(from peer.ID, rpc *pb.Pa
 		return err
 	}
 
-	snapshot := make(map[peer.ID]PeerState, len(state.peerState))
-	for id, peerState := range state.peerState {
-		snapshot[id] = e.ClonePeerState(peerState)
-	}
-	tx := &IncomingRPCTransaction[PeerState]{peerStates: snapshot}
-	if err = e.OnIncomingRPC(from, tx, rpc); err != nil {
+	// OnIncomingRPC errors reject this Partial field. Callbacks must validate
+	// before mutating an existing group's application state. For a group created
+	// by this field, undo the extension-owned allocation and quota reservation.
+	if err = e.OnIncomingRPC(from, state.peerState, rpc); err != nil {
 		if !existed {
 			delete(e.statePerTopicPerGroup[topic], string(groupID))
 			if len(e.statePerTopicPerGroup[topic]) == 0 {
@@ -356,10 +327,6 @@ func (e *PartialMessagesExtension[PeerState]) HandleRPC(from peer.ID, rpc *pb.Pa
 		return err
 	}
 
-	state.peerState = snapshot
-	for _, effect := range tx.deferred {
-		effect()
-	}
 	return nil
 }
 

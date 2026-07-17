@@ -417,13 +417,7 @@ func TestPartialMessagesOverTopicStreams(t *testing.T) {
 					}
 					partialExt[i].PublishPartial(topic, groupID, pm.publishActions)
 				},
-				ClonePeerState: func(state peerState) peerState {
-					state.sent = append(bitmap.Bitmap(nil), state.sent...)
-					state.recvd = append(bitmap.Bitmap(nil), state.recvd...)
-					return state
-				},
-				OnIncomingRPC: func(from peer.ID, tx *partialmessages.IncomingRPCTransaction[peerState], rpc *pb.PartialMessagesExtension) error {
-					peerStates := tx.PeerStates()
+				OnIncomingRPC: func(from peer.ID, peerStates map[peer.ID]peerState, rpc *pb.PartialMessagesExtension) error {
 					peerState := peerStates[from]
 					groupID := rpc.GroupID
 					pm, ok := partialMessageStore[i][topic+string(groupID)]
