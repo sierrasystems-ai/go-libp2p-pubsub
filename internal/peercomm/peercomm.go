@@ -205,7 +205,6 @@ type cancelPendingInboundTopicRPC struct {
 type stop struct{ done chan struct{} }
 type startOutbound struct{ backoff time.Duration }
 type outboundLifecycleEnded struct{ opened bool }
-type outboundLifecycleEnded struct{ opened bool }
 
 func (inboundControlOpen) actorEvent()           {}
 func (inboundControlRPC) actorEvent()            {}
@@ -216,7 +215,6 @@ func (inboundTopicClose) actorEvent()            {}
 func (cancelPendingInboundTopicRPC) actorEvent() {}
 func (stop) actorEvent()                         {}
 func (startOutbound) actorEvent()                {}
-func (outboundLifecycleEnded) actorEvent()       {}
 func (outboundLifecycleEnded) actorEvent()       {}
 
 type inboundTopic struct {
@@ -378,6 +376,7 @@ func (a *Actor) run() {
 	counts := make(map[string]int)
 	total := 0
 	outboundActive := false
+	retirementPending := false
 	emit := func(ev InboundEvent) bool {
 		if a.registry.hooks.EmitInbound == nil {
 			return true
@@ -441,21 +440,8 @@ func (a *Actor) run() {
 				}
 				close(ev.done)
 			case outboundLifecycleEnded:
-				// The terminal event runs after started is cleared, guaranteeing a
-				// retirement check even when the final inbound close happened first.
-				h := a.registry.hooks
-				if ev.opened {
-					if h.OutboundDead != nil {
-						h.OutboundDead(a.peer)
-					}
-				} else if h.OutboundOpenFailed != nil {
-					h.OutboundOpenFailed(a.peer)
-				}
-				if retire() {
-					return
-				}
-			case outboundLifecycleEnded:
 				outboundActive = false
+				retirementPending = true
 				h := a.registry.hooks
 				if ev.opened {
 					if h.OutboundDead != nil {
@@ -463,9 +449,6 @@ func (a *Actor) run() {
 					}
 				} else if h.OutboundOpenFailed != nil {
 					h.OutboundOpenFailed(a.peer)
-				}
-				if retire() {
-					return
 				}
 			case setOutboundEnabled:
 				if ev.generation != outbound.generation {
@@ -620,6 +603,11 @@ func (a *Actor) run() {
 			case stop:
 				shutdown()
 				close(ev.done)
+				return
+			}
+			// A terminal callback may enqueue Start reentrantly. Defer retirement
+			// until those already-submitted events have been observed by the actor.
+			if retirementPending && len(a.events) == 0 && retire() {
 				return
 			}
 		case <-a.ctx.Done():

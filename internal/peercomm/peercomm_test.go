@@ -62,15 +62,14 @@ func TestOutboundTerminalCallbackCanRestart(t *testing.T) {
 	var callbacks atomic.Int32
 	var actor *Actor
 	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{
-		OutboundDead: func(peer.ID) {
+		OutboundOpenFailed: func(peer.ID) {
 			if callbacks.Add(1) == 1 {
 				actor.Start(time.Hour)
 			}
 		},
 	})
 	actor = registry.For(peer.ID("restart-peer"))
-	actor.started.Store(true)
-	actor.outboundTerminated(true)
+	actor.Start(0)
 	deadline := time.After(time.Second)
 	for callbacks.Load() != 1 {
 		select {
@@ -80,8 +79,8 @@ func TestOutboundTerminalCallbackCanRestart(t *testing.T) {
 			runtime.Gosched()
 		}
 	}
-	if !actor.started.Load() {
-		t.Fatal("restart requested by terminal callback was lost")
+	if _, ok := registry.Existing(actor.peer); !ok {
+		t.Fatal("callback restart did not retain actor")
 	}
 }
 
