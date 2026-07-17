@@ -1410,3 +1410,35 @@ func FuzzPeerInitiatedCounter(f *testing.F) {
 		}
 	})
 }
+
+func TestHandleRPCFailureRollsBackNewGroup(t *testing.T) {
+	topic := "topic"
+	from := peer.ID("peer")
+	calls := 0
+	handler := PartialMessagesExtension[peerState]{
+		Logger:       slog.Default(),
+		OnEmitGossip: func(string, []byte, []peer.ID, map[peer.ID]peerState) {},
+		OnIncomingRPC: func(peer.ID, map[peer.ID]peerState, *pubsub_pb.PartialMessagesExtension) error {
+			calls++
+			return errors.New("invalid partial")
+		},
+	}
+	if err := handler.Init(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	err := handler.HandleRPC(from, &pubsub_pb.PartialMessagesExtension{TopicID: &topic, GroupID: []byte("group")})
+	if err == nil {
+		t.Fatal("expected callback error")
+	}
+	if calls != 1 {
+		t.Fatalf("callback calls=%d, want 1", calls)
+	}
+	if _, ok := handler.statePerTopicPerGroup[topic]; ok {
+		t.Fatal("failed partial left group state behind")
+	}
+	ctr := handler.peerInitiatedGroupCounter[topic]
+	if ctr == nil || ctr.total != 0 || len(ctr.perPeer) != 0 {
+		t.Fatalf("failed partial consumed group quota: %#v", ctr)
+	}
+}

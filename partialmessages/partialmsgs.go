@@ -306,14 +306,24 @@ func (e *PartialMessagesExtension[PeerState]) HandleRPC(from peer.ID, rpc *pb.Pa
 
 	topic := rpc.GetTopicID()
 	groupID := rpc.GroupID
+	_, existed := e.statePerTopicPerGroup[topic][string(groupID)]
 
 	state, err := e.groupState(topic, groupID, true, from)
 	if err != nil {
 		return err
 	}
 
-	err = e.OnIncomingRPC(from, state.peerState, rpc)
-	if err != nil {
+	// OnIncomingRPC errors reject this Partial field. Callbacks must validate
+	// before mutating an existing group's application state. For a group created
+	// by this field, undo the extension-owned allocation and quota reservation.
+	if err = e.OnIncomingRPC(from, state.peerState, rpc); err != nil {
+		if !existed {
+			delete(e.statePerTopicPerGroup[topic], string(groupID))
+			if len(e.statePerTopicPerGroup[topic]) == 0 {
+				delete(e.statePerTopicPerGroup, topic)
+			}
+			e.peerInitiatedGroupCounter[topic].Dec(from)
+		}
 		return err
 	}
 
