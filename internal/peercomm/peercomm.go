@@ -8,7 +8,6 @@ import (
 	"log/slog"
 
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p-pubsub/internal/topicstreams"
@@ -122,6 +121,13 @@ func (r *Registry) Existing(pid peer.ID) (*Actor, bool) {
 	a, ok := r.peers[pid]
 	return a, ok
 }
+
+// Len returns the number of live peer actors registered.
+func (r *Registry) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.peers)
+}
 func (r *Registry) remove(pid peer.ID, a *Actor) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -163,7 +169,6 @@ type Actor struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	queue    *rpcQueue
-	started  atomic.Bool
 }
 type actorEvent interface{ actorEvent() }
 
@@ -198,6 +203,9 @@ type cancelPendingInboundTopicRPC struct {
 	ack       chan struct{}
 }
 type stop struct{ done chan struct{} }
+type startOutbound struct{ backoff time.Duration }
+type outboundLifecycleEnded struct{ opened bool }
+type outboundLifecycleEnded struct{ opened bool }
 
 func (inboundControlOpen) actorEvent()           {}
 func (inboundControlRPC) actorEvent()            {}
@@ -207,6 +215,9 @@ func (inboundTopicRPC) actorEvent()              {}
 func (inboundTopicClose) actorEvent()            {}
 func (cancelPendingInboundTopicRPC) actorEvent() {}
 func (stop) actorEvent()                         {}
+func (startOutbound) actorEvent()                {}
+func (outboundLifecycleEnded) actorEvent()       {}
+func (outboundLifecycleEnded) actorEvent()       {}
 
 type inboundTopic struct {
 	stream     network.Stream
@@ -366,6 +377,7 @@ func (a *Actor) run() {
 	topics := make(map[uint64]*inboundTopic)
 	counts := make(map[string]int)
 	total := 0
+	outboundActive := false
 	emit := func(ev InboundEvent) bool {
 		if a.registry.hooks.EmitInbound == nil {
 			return true
@@ -385,7 +397,7 @@ func (a *Actor) run() {
 	}
 	closeOutbound := func() { outbound.retire() }
 	retire := func() bool {
-		if controlSet || len(topics) > 0 || a.started.Load() {
+		if controlSet || len(topics) > 0 || outboundActive {
 			return false
 		}
 		return a.registry.remove(a.peer, a)
@@ -401,6 +413,12 @@ func (a *Actor) run() {
 		select {
 		case raw := <-a.events:
 			switch ev := raw.(type) {
+			case startOutbound:
+				if outboundActive {
+					continue
+				}
+				outboundActive = true
+				go a.runOutbound(ev.backoff)
 			case beginOutboundSession:
 				outbound.retire()
 				nextOutboundGeneration++
@@ -422,6 +440,33 @@ func (a *Actor) run() {
 					outbound.retire()
 				}
 				close(ev.done)
+			case outboundLifecycleEnded:
+				// The terminal event runs after started is cleared, guaranteeing a
+				// retirement check even when the final inbound close happened first.
+				h := a.registry.hooks
+				if ev.opened {
+					if h.OutboundDead != nil {
+						h.OutboundDead(a.peer)
+					}
+				} else if h.OutboundOpenFailed != nil {
+					h.OutboundOpenFailed(a.peer)
+				}
+				if retire() {
+					return
+				}
+			case outboundLifecycleEnded:
+				outboundActive = false
+				h := a.registry.hooks
+				if ev.opened {
+					if h.OutboundDead != nil {
+						h.OutboundDead(a.peer)
+					}
+				} else if h.OutboundOpenFailed != nil {
+					h.OutboundOpenFailed(a.peer)
+				}
+				if retire() {
+					return
+				}
 			case setOutboundEnabled:
 				if ev.generation != outbound.generation {
 					continue
@@ -668,24 +713,9 @@ func (q *rpcQueue) close() {
 // Send enqueues an RPC without blocking. Urgent RPCs are drained before normal RPCs.
 func (a *Actor) Send(rpc *pb.RPC, urgent bool) error { return a.queue.push(rpc, urgent, false) }
 
-// Start opens and owns the outbound control stream after the requested backoff.
+// Start asks the actor to open and own an outbound control stream after backoff.
 func (a *Actor) Start(backoff time.Duration) {
-	if !a.started.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		if backoff > 0 {
-			timer := time.NewTimer(backoff)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-			case <-a.ctx.Done():
-				a.started.Store(false)
-				return
-			}
-		}
-		a.runOutbound()
-	}()
+	a.submit(startOutbound{backoff: backoff})
 }
 
 // HandleInboundTopicStream owns the complete inbound topic-stream lifecycle.
@@ -756,17 +786,24 @@ func (a *Actor) HandleInboundControl(s network.Stream) {
 	}
 }
 
-func (a *Actor) runOutbound() {
+func (a *Actor) runOutbound(backoff time.Duration) {
 	h := a.registry.hooks
 	opened := false
+	defer func() { a.submit(outboundLifecycleEnded{opened: opened}) }()
+	if backoff > 0 {
+		timer := time.NewTimer(backoff)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-a.ctx.Done():
+			return
+		}
+	}
 	generation, ok := a.beginOutboundSession()
 	if !ok {
 		return
 	}
-	defer func() {
-		a.endOutbound(generation)
-		a.outboundTerminated(opened)
-	}()
+	defer a.endOutbound(generation)
 	if a.registry.config.Host == nil || h.Protocols == nil {
 		return
 	}
@@ -845,18 +882,4 @@ func (a *Actor) writeRPC(s network.Stream, rpc *pb.RPC) error {
 		a.registry.config.Logger.Log(a.ctx, slog.LevelDebug, "sent rpc", "peer", a.peer)
 	}
 	return nil
-}
-
-func (a *Actor) outboundTerminated(opened bool) {
-	// Publish the idle state before notifying PubSub so a callback-triggered
-	// restart cannot be rejected by the previous session's start guard.
-	a.started.Store(false)
-	h := a.registry.hooks
-	if opened {
-		if h.OutboundDead != nil {
-			h.OutboundDead(a.peer)
-		}
-	} else if h.OutboundOpenFailed != nil {
-		h.OutboundOpenFailed(a.peer)
-	}
 }

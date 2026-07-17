@@ -155,16 +155,28 @@ func (a *Actor) endOutbound(generation uint64) {
 }
 
 func (a *Actor) routeOutbound(ctx context.Context, generation uint64, rpc *pb.RPC) routeReply {
+	// Cancellation observed before submission has no actor side effects.
+	select {
+	case <-ctx.Done():
+		return routeReply{disposition: routeAborted}
+	default:
+	}
 	reply := make(chan routeReply, 1)
 	if !a.submit(routeOutboundRPC{generation: generation, rpc: rpc, reply: reply}) {
 		return routeReply{disposition: routeAborted}
 	}
+	// Cancellation only aborts before submission. Once the actor accepted the
+	// event, wait for its one terminal disposition so a routed payload and its
+	// control remainder can never be abandoned with unknown status.
 	select {
 	case result := <-reply:
 		return result
-	case <-ctx.Done():
-		return routeReply{disposition: routeAborted}
 	case <-a.done:
-		return routeReply{disposition: routeAborted}
+		select {
+		case result := <-reply:
+			return result
+		default:
+			return routeReply{disposition: routeAborted}
+		}
 	}
 }

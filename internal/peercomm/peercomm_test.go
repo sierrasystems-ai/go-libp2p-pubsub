@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -70,8 +71,14 @@ func TestOutboundTerminalCallbackCanRestart(t *testing.T) {
 	actor = registry.For(peer.ID("restart-peer"))
 	actor.started.Store(true)
 	actor.outboundTerminated(true)
-	if callbacks.Load() != 1 {
-		t.Fatalf("expected one terminal callback, got %d", callbacks.Load())
+	deadline := time.After(time.Second)
+	for callbacks.Load() != 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected one terminal callback, got %d", callbacks.Load())
+		default:
+			runtime.Gosched()
+		}
 	}
 	if !actor.started.Load() {
 		t.Fatal("restart requested by terminal callback was lost")
@@ -356,5 +363,87 @@ func TestRouteCancellationNeverFallsBackToControl(t *testing.T) {
 	result := actor.routeOutbound(ctx, generation, rpc)
 	if result.disposition != routeAborted || result.Control != nil {
 		t.Fatalf("canceled route manufactured control fallback: %#v", result)
+	}
+}
+
+func TestPostSubmitCancellationReturnsTerminalRouteDisposition(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	emitting, release := make(chan struct{}), make(chan struct{})
+	var drops atomic.Int32
+	stream := newRemoteUnsubscribeStream()
+	registry := NewRegistry(ctx, Config{
+		OutboundQueueSize: 1,
+		TopicStreamsHooks: topicstreams.OutboundHooks{Drop: func(peer.ID, topicstreams.Envelope) { drops.Add(1) }},
+	}, Hooks{EmitInbound: func(_ peer.ID, event InboundEvent) bool {
+		if event.Kind == InboundRPC {
+			close(emitting)
+			<-release
+		}
+		return true
+	}})
+	actor := registry.For(peer.ID("route-peer"))
+	generation, ok := actor.beginOutboundSession()
+	if !ok {
+		t.Fatal("begin outbound session")
+	}
+	streams := topicstreams.NewOutboundStreams(ctx, remoteUnsubscribeHost{stream: stream}, peer.ID("route-peer"), 1, nil, registry.config.TopicStreamsHooks)
+	if !actor.attachOutbound(generation, streams) {
+		t.Fatal("attach outbound streams")
+	}
+	actor.SetTopicStreamsEnabled(Session{generation}, true)
+
+	inbound, ok := actor.OpenInboundControl(stream)
+	if !ok {
+		t.Fatal("open inbound control")
+	}
+	actor.DeliverInboundControl(inbound, &pb.RPC{})
+	<-emitting
+
+	routeCtx, routeCancel := context.WithCancel(context.Background())
+	done := make(chan routeReply, 1)
+	topic, subscribe := "unauthorized", true
+	go func() {
+		done <- actor.routeOutbound(routeCtx, generation, &pb.RPC{
+			Publish:       []*pb.Message{{Topic: &topic}},
+			Subscriptions: []*pb.RPC_SubOpts{{Topicid: &topic, Subscribe: &subscribe}},
+		})
+	}()
+	time.Sleep(10 * time.Millisecond) // route event is queued behind the blocked actor
+	routeCancel()
+	close(release)
+	result := <-done
+	if result.disposition != routeCompleted || result.Dropped != 1 || result.Accepted != 0 {
+		t.Fatalf("unexpected terminal route disposition: %#v", result)
+	}
+	if result.Control == nil || len(result.Control.Subscriptions) != 1 {
+		t.Fatalf("control remainder was lost: %#v", result.Control)
+	}
+	if drops.Load() != 1 {
+		t.Fatalf("drop accounting=%d, want 1", drops.Load())
+	}
+}
+
+func TestOutboundTerminationRetiresActorAndQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registry := NewRegistry(ctx, Config{OutboundQueueSize: 1}, Hooks{})
+	pid := peer.ID("churn-peer")
+	old := registry.For(pid)
+	old.Start(0)
+	select {
+	case <-old.Done():
+	case <-time.After(time.Second):
+		t.Fatal("actor was not retired after outbound lifetime ended")
+	}
+	if _, ok := registry.Existing(pid); ok {
+		t.Fatal("retired actor remained in registry")
+	}
+	if err := old.Send(&pb.RPC{}, false); !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("retired queue accepted send: %v", err)
+	}
+	fresh := registry.For(pid)
+	if fresh == old {
+		t.Fatal("registry reused stale actor")
 	}
 }
