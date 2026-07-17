@@ -184,6 +184,7 @@ type inboundControlOpen struct {
 type inboundControlRPC struct {
 	generation Generation
 	rpc        *pb.RPC
+	reserved   bool
 }
 type inboundControlClose struct {
 	generation Generation
@@ -231,17 +232,22 @@ type inboundTopic struct {
 
 func (a *Actor) submit(ev actorEvent) bool {
 	a.submitMu.Lock()
-	defer a.submitMu.Unlock()
 	if a.retiring {
+		a.submitMu.Unlock()
 		return false
 	}
+	// Reserve this submission before releasing the barrier lock. Retirement
+	// cannot cross the barrier while either a sender or an accepted event exists.
+	a.pending++
+	a.submitMu.Unlock()
 	select {
 	case a.events <- ev:
-		a.pending++
 		return true
 	case <-a.done:
+		a.consumed()
 		return false
 	case <-a.ctx.Done():
+		a.consumed()
 		return false
 	}
 }
@@ -260,7 +266,12 @@ func (a *Actor) OpenInboundControl(s network.Stream) (Generation, bool) {
 	}
 }
 func (a *Actor) DeliverInboundControl(g Generation, r *pb.RPC) {
-	a.submit(inboundControlRPC{g, r})
+	if !a.delivery.reserve() {
+		return
+	}
+	if !a.submit(inboundControlRPC{generation: g, rpc: r, reserved: true}) {
+		a.delivery.release()
+	}
 }
 func (a *Actor) CloseInboundControl(g Generation, s network.Stream) {
 	a.submit(inboundControlClose{g, s})
@@ -383,7 +394,7 @@ func (a *Actor) run() {
 	outboundActive := false
 	retirementPending := false
 	emit := func(ev InboundEvent, reply chan bool) bool {
-		return a.delivery.submit(ev, reply)
+		return a.delivery.submit(ev, reply, false)
 	}
 	closeTopics := func() {
 		for _, t := range topics {
@@ -510,7 +521,7 @@ func (a *Actor) run() {
 				if ev.generation.value != controlGen || !controlSet {
 					continue
 				}
-				if !emit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control, Session: Session{outbound.generation}}, nil) {
+				if !a.delivery.submit(InboundEvent{Kind: InboundRPC, RPC: ev.rpc, Stream: control, Session: Session{outbound.generation}}, nil, ev.reserved) {
 					shutdown()
 					return
 				}
