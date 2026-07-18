@@ -159,9 +159,10 @@ type PubSub struct {
 
 	peerComm *peercomm.Registry
 
-	seenMessages    timecache.TimeCache
-	seenMsgTTL      time.Duration
-	seenMsgStrategy timecache.Strategy
+	seenMessages       timecache.TimeCache
+	seenMsgTTL         time.Duration
+	seenMsgStrategy    timecache.Strategy
+	recentUnsubscribed map[string]time.Time
 
 	// generator used to compute the ID for a message
 	idGen *msgIDGenerator
@@ -285,6 +286,7 @@ type RPC struct {
 	// unexported on purpose, not sending this over the wire
 	from      peer.ID
 	transport peercomm.Transport
+	stream    network.Stream
 }
 
 func wrapInboundRPC(rpc *pb.RPC, from peer.ID, transport peercomm.Transport) *RPC {
@@ -638,6 +640,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		blacklistPeer:         make(chan peer.ID),
 		seenMsgTTL:            TimeCacheDuration,
 		seenMsgStrategy:       TimeCacheStrategy,
+		recentUnsubscribed:    make(map[string]time.Time),
 		idGen:                 newMsgIdGenerator(),
 		counter:               uint64(time.Now().UnixNano()),
 	}
@@ -680,7 +683,9 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 				ps.enqueuePeerEvent(incomingUnion{kind: incomingKindNewStream, actor: a, s: s})
 			},
 			InboundRPC: func(a *peercomm.Actor, s network.Stream, transport peercomm.Transport, rpc *pb.RPC) {
-				ps.enqueuePeerEvent(incomingUnion{kind: incomingKindRPC, actor: a, s: s, rpc: wrapInboundRPC(rpc, a.Peer(), transport)})
+				wrapped := wrapInboundRPC(rpc, a.Peer(), transport)
+				wrapped.stream = s
+				ps.enqueuePeerEvent(incomingUnion{kind: incomingKindRPC, actor: a, s: s, rpc: wrapped})
 			},
 			InboundClosed: func(a *peercomm.Actor, s network.Stream) {
 				ps.enqueuePeerEvent(incomingUnion{kind: incomingKindClosedStream, actor: a, s: s})
@@ -700,10 +705,34 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 			OutboundDead: func(a *peercomm.Actor, s network.Stream, err error) {
 				ps.enqueuePeerEvent(incomingUnion{kind: incomingKindOutboundDead, actor: a, s: s, err: err})
 			},
+			TopicAllowed: ps.topicStreamAllowed,
+			TopicMisbehavior: func(a *peercomm.Actor, _ string) {
+				ps.topicStreamMisbehavior(a)
+			},
 		},
 	})
 	if err != nil {
 		return nil, err
+	}
+	if gs, ok := rt.(*GossipSubRouter); ok {
+		gs.extensions.enableTopicStreams = func(id peer.ID) {
+			if actor, found := ps.peerComm.Lookup(id); found {
+				actor.EnableTopicStreams()
+			}
+		}
+		gs.extensions.disableTopicStreams = func(id peer.ID) {
+			if actor, found := ps.peerComm.Lookup(id); found {
+				actor.DisableTopicStreams()
+			}
+		}
+		gs.extensions.protocolViolation = func(id peer.ID, stream network.Stream) {
+			if actor, found := ps.peerComm.Lookup(id); found {
+				actor.ProtocolViolation(stream)
+			}
+		}
+		if gs.extensions.myExtensions.TopicStreams {
+			h.SetStreamHandler(peercomm.TopicStreamsProtocol, ps.handleTopicStream)
+		}
 	}
 
 	for _, id := range rt.Protocols() {
@@ -1215,6 +1244,10 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	if len(subs) == 0 {
 		delete(p.mySubs, sub.topic)
+		p.recentUnsubscribed[sub.topic] = time.Now()
+		for _, actor := range p.peerComm.All() {
+			actor.CloseTopic(sub.topic)
+		}
 
 		// stop announcing only if there are no more subs and relays
 		if p.myRelays[sub.topic] == 0 {
@@ -1312,6 +1345,10 @@ func (p *PubSub) handleRemoveRelay(topic string) {
 
 		// stop announcing only if there are no more relays and subs
 		if len(p.mySubs[topic]) == 0 {
+			p.recentUnsubscribed[topic] = time.Now()
+			for _, actor := range p.peerComm.All() {
+				actor.CloseTopic(topic)
+			}
 			p.disc.StopAdvertise(topic)
 			p.announce(topic, false)
 			p.rt.Leave(topic)
@@ -1468,6 +1505,9 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 }
 
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
+	if gs, ok := p.rt.(*GossipSubRouter); ok && !gs.extensions.Preprocess(rpc) {
+		return
+	}
 	// pass the rpc through app specific validation (if any available).
 	if p.appSpecificRpcInspector != nil {
 		// check if the RPC is allowed by the external inspector
@@ -1513,6 +1553,11 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				}
 			}
 		} else {
+			if p.peerComm != nil {
+				if actor, found := p.peerComm.Lookup(rpc.from); found {
+					actor.CloseTopic(t)
+				}
+			}
 			tmap, ok := p.topics[t]
 			if !ok {
 				continue
